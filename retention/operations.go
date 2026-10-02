@@ -43,6 +43,16 @@ type DestructionRequest struct {
 	ArchiveIDs    []string
 }
 
+// CheckRequest 是销毁前一次只做核对的请求，字段含义与 DestructionRequest 相同。
+//
+// 核对不销毁任何档案、不生成或改写清册，也不占用申请编号：
+// 核对失败或发现阻碍后，仍可沿用同一编号继续核对或正式提交。
+type CheckRequest struct {
+	ApplicationID string
+	ProcessedOn   Date
+	ArchiveIDs    []string
+}
+
 // normalizeText 去除首尾空白；空白字段统一按空白处理，避免同值异写。
 func normalizeText(s string) string { return strings.TrimSpace(s) }
 
@@ -206,34 +216,9 @@ func (s *Store) Release(in ReleaseInput) error {
 // 则返回原清册；沿用编号但改变日期或档案集合则失败。失败过的申请
 // 在条件改变后可以用同一编号再次提交。
 func (s *Store) Destroy(req DestructionRequest) (Manifest, error) {
-	applicationID, err := requireText(req.ApplicationID, "申请编号")
+	applicationID, ids, seen, err := validateBatchInputs(req.ApplicationID, req.ProcessedOn, req.ArchiveIDs)
 	if err != nil {
 		return Manifest{}, err
-	}
-	if err := requireDate(req.ProcessedOn, "处理日期"); err != nil {
-		return Manifest{}, err
-	}
-	if len(req.ArchiveIDs) == 0 {
-		return Manifest{}, fmt.Errorf("retention: 申请 %s 的销毁名单为空: %w",
-			applicationID, ErrEmptyDestructionList)
-	}
-
-	// 规范化名单并检查名单内重复（输入校验先于任何业务判断）。
-	ids := make([]string, 0, len(req.ArchiveIDs))
-	for _, raw := range req.ArchiveIDs {
-		id, err := requireText(raw, "档案编号")
-		if err != nil {
-			return Manifest{}, err
-		}
-		ids = append(ids, id)
-	}
-	seen := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		if _, dup := seen[id]; dup {
-			return Manifest{}, fmt.Errorf("retention: 申请 %s 的销毁名单中档案 %s 重复: %w",
-				applicationID, id, ErrDuplicateSelection)
-		}
-		seen[id] = struct{}{}
 	}
 
 	var result Manifest
