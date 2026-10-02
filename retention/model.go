@@ -34,6 +34,8 @@ type ArchiveHistory struct {
 	ID                    string
 	Category              string
 	Start                 Date
+	// RegisteredEnd 是登记时的最初截止日，此后修订只改变当前截止日，不改变它。
+	RegisteredEnd         Date
 	RetentionEnd          Date
 	Destroyed             bool
 	ManifestApplicationID string
@@ -41,6 +43,8 @@ type ArchiveHistory struct {
 	Freezes []FreezeRecord
 	// ActiveFreezes 仅包含尚未解除的冻结。
 	ActiveFreezes []FreezeRecord
+	// Revisions 包含全部保管截止日修订记录，按成功办理顺序排列。
+	Revisions []RevisionRecord
 	// Manifest 是该档案销毁时生成的已关闭清册；未销毁时为 nil。
 	Manifest *Manifest
 }
@@ -125,16 +129,54 @@ type CheckReport struct {
 	Manifest *Manifest
 }
 
+// RevisionInput 是修订档案保管截止日所需的信息。
+//
+// 修订编号与原因为必填文本（去首尾空白后不得为空）；修订日期沿用真实日历日期规则，
+// 仅用于记录，提交成功即采用新期限。新截止日不能早于起算日，也不能等于提交的原截止日。
+// 提交的原截止日是调用者看到的当前截止日，必须与保管库当前保存值一致，否则因期限已变化而失败。
+type RevisionInput struct {
+	RevisionID  string
+	ArchiveID   string
+	OriginalEnd Date
+	NewEnd      Date
+	RevisedOn   Date
+	Reason      string
+}
+
+// RevisionRecord 描述一条成功的保管截止日修订记录。
+//
+// 每条记录带修订编号、所属档案、修订前后截止日、修订日期与原因。
+// 返回值是复制生成的只读视图，调用者修改不影响保管库中保存的历史。
+type RevisionRecord struct {
+	RevisionID  string
+	ArchiveID   string
+	OriginalEnd Date
+	NewEnd      Date
+	RevisedOn   Date
+	Reason      string
+}
+
 // 以下类型是持久化到磁盘的数据结构，仅在包内使用。
 
 type archiveRecord struct {
-	ID         string          `json:"id"`
-	Category   string          `json:"category"`
-	Start      Date            `json:"start"`
-	End        Date            `json:"end"`
-	Destroyed  bool            `json:"destroyed"`
-	ManifestID string          `json:"manifest_id,omitempty"`
-	Freezes    []*freezeRecord `json:"freezes"`
+	ID            string            `json:"id"`
+	Category      string            `json:"category"`
+	Start         Date              `json:"start"`
+	End           Date              `json:"end"`
+	RegisteredEnd Date              `json:"registered_end"`
+	Destroyed     bool              `json:"destroyed"`
+	ManifestID    string            `json:"manifest_id,omitempty"`
+	Freezes       []*freezeRecord   `json:"freezes"`
+	Revisions     []*revisionRecord `json:"revisions,omitempty"`
+}
+
+type revisionRecord struct {
+	RevisionID  string `json:"revision_id"`
+	ArchiveID   string `json:"archive_id"`
+	OriginalEnd Date   `json:"original_end"`
+	NewEnd      Date   `json:"new_end"`
+	RevisedOn   Date   `json:"revised_on"`
+	Reason      string `json:"reason"`
 }
 
 type freezeRecord struct {
@@ -163,6 +205,7 @@ type storeData struct {
 	Version   int                        `json:"version"`
 	Archives  map[string]*archiveRecord  `json:"archives"`
 	Manifests map[string]*manifestRecord `json:"manifests"`
+	Revisions map[string]*revisionRecord `json:"revisions,omitempty"`
 }
 
 func newStoreData() *storeData {
@@ -170,5 +213,6 @@ func newStoreData() *storeData {
 		Version:   1,
 		Archives:  map[string]*archiveRecord{},
 		Manifests: map[string]*manifestRecord{},
+		Revisions: map[string]*revisionRecord{},
 	}
 }

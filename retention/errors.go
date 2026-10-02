@@ -1,6 +1,9 @@
 package retention
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // 业务规则错误。调用方可用 errors.Is 判断失败类别，具体错误信息会附带上编号等上下文。
 var (
@@ -38,6 +41,16 @@ var (
 	ErrApplicationMismatch = errors.New("retention: 申请编号与已成功的申请不一致")
 	// ErrArchiveAlreadyOnManifest 表示档案已经出现在另一份成功清册中。
 	ErrArchiveAlreadyOnManifest = errors.New("retention: 档案已在其他销毁清册中")
+	// ErrDuplicateRevisionID 表示修订编号已成功使用，但本次提交内容与原修订不一致。
+	ErrDuplicateRevisionID = errors.New("retention: 修订编号已存在且提交内容不一致")
+	// ErrRevisionEndMismatch 表示提交的原截止日与保管库当前保存值不一致，期限已被他人修改。
+	ErrRevisionEndMismatch = errors.New("retention: 保管截止日已被修改")
+	// ErrRevisionEndUnchanged 表示修订后的新截止日与提交的原截止日相同。
+	ErrRevisionEndUnchanged = errors.New("retention: 修订后的截止日与原截止日相同")
+	// ErrRevisionIDUsedByManifest 表示该修订编号已被销毁申请使用，两个编号空间互不占用。
+	ErrRevisionIDUsedByManifest = errors.New("retention: 修订编号已被销毁申请使用")
+	// ErrApplicationIDUsedByRevision 表示该销毁申请编号已被修订记录使用。
+	ErrApplicationIDUsedByRevision = errors.New("retention: 销毁申请编号已被修订记录使用")
 )
 
 // InvalidDateError 说明 ParseDate 收到的值不是合法的 YYYY-MM-DD 真实日期。
@@ -51,3 +64,20 @@ func (e *InvalidDateError) Error() string {
 
 // Is 支持 errors.Is(err, ErrInvalidDate)。
 func (e *InvalidDateError) Is(target error) bool { return target == ErrInvalidDate }
+
+// RevisionEndMismatchError 说明提交的原截止日与保管库当前保存值不一致，
+// 期限已被他人修改。错误中给出当前截止日，调用方可据此提示或重新提交。
+// 用 errors.Is(err, ErrRevisionEndMismatch) 判别。
+type RevisionEndMismatchError struct {
+	ArchiveID string
+	Submitted Date
+	Current   Date
+}
+
+func (e *RevisionEndMismatchError) Error() string {
+	return fmt.Sprintf("retention: 档案 %s 的保管截止日已变化：当前截止日为 %s，提交的原截止日为 %s",
+		e.ArchiveID, e.Current, e.Submitted)
+}
+
+// Is 支持 errors.Is(err, ErrRevisionEndMismatch)。
+func (e *RevisionEndMismatchError) Is(target error) bool { return target == ErrRevisionEndMismatch }

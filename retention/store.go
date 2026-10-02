@@ -109,6 +109,9 @@ func (s *Store) load() (*storeData, error) {
 	if data.Manifests == nil {
 		data.Manifests = map[string]*manifestRecord{}
 	}
+	if data.Revisions == nil {
+		data.Revisions = map[string]*revisionRecord{}
+	}
 	return data, nil
 }
 

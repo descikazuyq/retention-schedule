@@ -98,11 +98,12 @@ func (s *Store) Register(in RegisterInput) error {
 			return fmt.Errorf("retention: 档案编号 %s 已登记: %w", id, ErrDuplicateID)
 		}
 		data.Archives[id] = &archiveRecord{
-			ID:       id,
-			Category: category,
-			Start:    in.Start,
-			End:      in.End,
-			Freezes:  nil,
+			ID:            id,
+			Category:      category,
+			Start:         in.Start,
+			End:           in.End,
+			RegisteredEnd: in.End,
+			Freezes:       nil,
 		}
 		return nil
 	})
@@ -203,6 +204,132 @@ func (s *Store) Release(in ReleaseInput) error {
 	})
 }
 
+// Revise 修订档案的保管截止日。
+//
+// 调用者发现登记的期限需要调整时，可以对尚未销毁的档案延长或缩短截止日，
+// 不必重新登记；编号、类别与起算日均不可改动。被冻结的档案也允许修订期限，
+// 但修订不能解除冻结，期限缩短后仍须满足原有冻结规则才能销毁。
+//
+// 每次提交包含修订编号、档案编号、调用者看到的原截止日、新截止日、修订日期和原因。
+// 修订编号与原因去首尾空白后不得为空；日期沿用真实日历日期规则。新截止日不能早于
+// 起算日，也不能等于所提交的原截止日。修订日期仅用于记录，提交成功即采用新期限。
+//
+// 首次办理时，所提交的原截止日必须与当前保存值相同，否则返回可区分的期限已变化错误
+// （ErrRevisionEndMismatch）并提供当前截止日，不能覆盖他人的修改。
+//
+// 修订编号在同一保管库的全部档案之间唯一，且与销毁申请编号互不占用。同编号且提交
+// 内容相同的重试只返回第一次成功的记录，不增加历史；即使后来再次改过期限或档案已被
+// 销毁，这次重试仍能取回原记录。沿用成功编号改变任何一项内容时返回编号冲突
+// （ErrDuplicateRevisionID）。失败过的编号仍可用于重新提交。
+//
+// 任何失败都不改变期限或留下修订历史。返回值是复制生成的只读视图，调用者修改不影响
+// 保管库中保存的记录。
+func (s *Store) Revise(in RevisionInput) (RevisionRecord, error) {
+	revisionID, err := requireText(in.RevisionID, "修订编号")
+	if err != nil {
+		return RevisionRecord{}, err
+	}
+	archiveID, err := requireText(in.ArchiveID, "档案编号")
+	if err != nil {
+		return RevisionRecord{}, err
+	}
+	reason, err := requireText(in.Reason, "修订原因")
+	if err != nil {
+		return RevisionRecord{}, err
+	}
+	if err := requireDate(in.RevisedOn, "修订日期"); err != nil {
+		return RevisionRecord{}, err
+	}
+	if err := requireDate(in.OriginalEnd, "原截止日"); err != nil {
+		return RevisionRecord{}, err
+	}
+	if err := requireDate(in.NewEnd, "新截止日"); err != nil {
+		return RevisionRecord{}, err
+	}
+	if in.NewEnd.Equal(in.OriginalEnd) {
+		return RevisionRecord{}, fmt.Errorf("retention: 档案 %s 修订后的新截止日 %s 与原截止日相同: %w",
+			archiveID, in.NewEnd, ErrRevisionEndUnchanged)
+	}
+
+	var result RevisionRecord
+	err = s.mutate(func(data *storeData) error {
+		// 幂等：修订编号已成功使用时，内容完全相同则返回第一次成功的记录，否则编号冲突。
+		// 取回原记录不依赖档案当前状态，即使期限后来被再次修改或档案已销毁也不受影响。
+		if existing, ok := data.Revisions[revisionID]; ok {
+			if !sameRevision(existing, in, archiveID, reason) {
+				return fmt.Errorf("retention: 修订编号 %s 已成功使用，本次提交内容与原修订不一致: %w",
+					revisionID, ErrDuplicateRevisionID)
+			}
+			result = revisionFromRecord(existing)
+			return nil
+		}
+		// 修订编号与销毁申请编号互不占用。
+		if _, ok := data.Manifests[revisionID]; ok {
+			return fmt.Errorf("retention: 修订编号 %s 已被销毁申请使用: %w",
+				revisionID, ErrRevisionIDUsedByManifest)
+		}
+		ar, ok := data.Archives[archiveID]
+		if !ok {
+			return fmt.Errorf("retention: 档案 %s 不存在，不能修订保管截止日: %w",
+				archiveID, ErrNotFound)
+		}
+		if ar.Destroyed {
+			return fmt.Errorf("retention: 档案 %s 已销毁，不能修订保管截止日: %w",
+				archiveID, ErrDestroyed)
+		}
+		if in.NewEnd.Before(ar.Start) {
+			return fmt.Errorf("retention: 档案 %s 修订后的保管截止日 %s 早于起算日 %s: %w",
+				archiveID, in.NewEnd, ar.Start, ErrRetentionEndBeforeStart)
+		}
+		// 乐观核对：提交的原截止日必须与当前保存值一致，避免覆盖他人的修改。
+		if !in.OriginalEnd.Equal(ar.End) {
+			return &RevisionEndMismatchError{
+				ArchiveID: archiveID,
+				Submitted: in.OriginalEnd,
+				Current:   ar.End,
+			}
+		}
+		rec := &revisionRecord{
+			RevisionID:  revisionID,
+			ArchiveID:   archiveID,
+			OriginalEnd: in.OriginalEnd,
+			NewEnd:      in.NewEnd,
+			RevisedOn:   in.RevisedOn,
+			Reason:      reason,
+		}
+		data.Revisions[revisionID] = rec
+		ar.Revisions = append(ar.Revisions, rec)
+		ar.End = in.NewEnd
+		result = revisionFromRecord(rec)
+		return nil
+	})
+	if err != nil {
+		return RevisionRecord{}, err
+	}
+	return result, nil
+}
+
+// sameRevision 判断已成功修订与本次提交的全部内容是否一致。
+// 文本字段在调用入口已去首尾空白，这里直接比较规范化后的值。
+func sameRevision(rec *revisionRecord, in RevisionInput, archiveID, reason string) bool {
+	return rec.ArchiveID == archiveID &&
+		rec.Reason == reason &&
+		rec.OriginalEnd.Equal(in.OriginalEnd) &&
+		rec.NewEnd.Equal(in.NewEnd) &&
+		rec.RevisedOn.Equal(in.RevisedOn)
+}
+
+func revisionFromRecord(rec *revisionRecord) RevisionRecord {
+	return RevisionRecord{
+		RevisionID:  rec.RevisionID,
+		ArchiveID:   rec.ArchiveID,
+		OriginalEnd: rec.OriginalEnd,
+		NewEnd:      rec.NewEnd,
+		RevisedOn:   rec.RevisedOn,
+		Reason:      rec.Reason,
+	}
+}
+
 // Destroy 办理一次销毁申请。
 //
 // 只有名单中全部档案都存在、按处理日期已到期（处理日期不早于截止日，
@@ -231,6 +358,11 @@ func (s *Store) Destroy(req DestructionRequest) (Manifest, error) {
 			}
 			result = manifestFromRecord(existing)
 			return nil
+		}
+		// 申请编号与修订编号互不占用：该编号已被修订记录使用。
+		if _, ok := data.Revisions[applicationID]; ok {
+			return fmt.Errorf("retention: 申请编号 %s 已被修订记录使用: %w",
+				applicationID, ErrApplicationIDUsedByRevision)
 		}
 
 		// 逐份校验，任一不符合条件则整体放弃（此时尚未改动任何记录）。
@@ -346,14 +478,21 @@ func (s *Store) History(archiveID string) (h ArchiveHistory, found bool, err err
 			return nil
 		}
 		found = true
+		// 旧版本保存的档案没有登记最初截止日，此时登记截止日就是当前截止日。
+		registeredEnd := ar.RegisteredEnd
+		if registeredEnd.IsZero() {
+			registeredEnd = ar.End
+		}
 		h = ArchiveHistory{
 			ID:                    ar.ID,
 			Category:              ar.Category,
 			Start:                 ar.Start,
+			RegisteredEnd:         registeredEnd,
 			RetentionEnd:          ar.End,
 			Destroyed:             ar.Destroyed,
 			ManifestApplicationID: ar.ManifestID,
 			Freezes:               make([]FreezeRecord, 0, len(ar.Freezes)),
+			Revisions:             make([]RevisionRecord, 0, len(ar.Revisions)),
 		}
 		for _, fr := range ar.Freezes {
 			view := freezeFromRecord(fr)
@@ -361,6 +500,9 @@ func (s *Store) History(archiveID string) (h ArchiveHistory, found bool, err err
 			if !fr.Released {
 				h.ActiveFreezes = append(h.ActiveFreezes, view)
 			}
+		}
+		for _, rr := range ar.Revisions {
+			h.Revisions = append(h.Revisions, revisionFromRecord(rr))
 		}
 		if ar.Destroyed && ar.ManifestID != "" {
 			if rec, ok := data.Manifests[ar.ManifestID]; ok {

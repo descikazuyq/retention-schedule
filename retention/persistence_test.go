@@ -185,6 +185,15 @@ func TestSubprocessHelper(t *testing.T) {
 			ApplicationID: "APP-X", ProcessedOn: MustParseDate("2025-01-10"),
 			ArchiveIDs: []string{"A-1"},
 		})
+	case "revise":
+		_, err = s.Revise(RevisionInput{
+			RevisionID:  os.Getenv("RETENTION_HELPER_REVISION_ID"),
+			ArchiveID:   "A-1",
+			OriginalEnd: MustParseDate("2025-01-10"),
+			NewEnd:      MustParseDate(os.Getenv("RETENTION_HELPER_NEW_END")),
+			RevisedOn:   MustParseDate("2025-01-15"),
+			Reason:      "调整",
+		})
 	default:
 		fmt.Fprintf(os.Stderr, "unknown op %q\n", op)
 		os.Exit(2)
@@ -212,6 +221,28 @@ func runHelper(t *testing.T, dir, op, freezeID string) helperResult {
 	)
 	out, _ := cmd.CombinedOutput()
 	r := helperResult{op: op, failed: !cmd.ProcessState.Success()}
+	last := ""
+	for _, line := range splitLines(string(out)) {
+		if line == "PASS" || line == "FAIL" || line == "SKIP" {
+			continue
+		}
+		last = line
+	}
+	r.message = last
+	return r
+}
+
+func runHelperRevise(t *testing.T, dir, revisionID, newEnd string) helperResult {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=TestSubprocessHelper", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"RETENTION_HELPER_DIR="+dir,
+		"RETENTION_HELPER_OP=revise",
+		"RETENTION_HELPER_REVISION_ID="+revisionID,
+		"RETENTION_HELPER_NEW_END="+newEnd,
+	)
+	out, _ := cmd.CombinedOutput()
+	r := helperResult{op: "revise", failed: !cmd.ProcessState.Success()}
 	last := ""
 	for _, line := range splitLines(string(out)) {
 		if line == "PASS" || line == "FAIL" || line == "SKIP" {
@@ -313,4 +344,67 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestCrossProcessTwoRevises 验证两个本机程序同时把同一截止日改成不同日期，
+// 只能成功一次，另一次收到期限已变化错误。
+func TestCrossProcessTwoRevises(t *testing.T) {
+	for round := 0; round < 10; round++ {
+		dir := filepath.Join(t.TempDir(), "vault")
+		setup, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg(t, setup, "A-1", "合同", "2020-01-01", "2025-01-10")
+		if err := setup.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		results := make([]helperResult, 2)
+		wg.Add(2)
+		go func() { defer wg.Done(); results[0] = runHelperRevise(t, dir, "R-1", "2025-02-10") }()
+		go func() { defer wg.Done(); results[1] = runHelperRevise(t, dir, "R-2", "2025-03-10") }()
+		wg.Wait()
+
+		var r1, r2 helperResult
+		for _, r := range results {
+			if r.op == "revise" && r1.op == "" {
+				r1 = r
+			} else {
+				r2 = r
+			}
+		}
+
+		check, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, found, _ := check.History("A-1")
+		if !found {
+			t.Fatalf("第 %d 轮：档案丢失", round)
+		}
+
+		switch {
+		case !r1.failed && !r2.failed:
+			t.Fatalf("第 %d 轮：两个程序同时成功", round)
+		case !r1.failed:
+			t.Logf("第 %d 轮：R-1 先成功", round)
+			if !r2.failed || !contains(r2.message, "已变化") {
+				t.Fatalf("第 %d 轮：后到者应收到期限已变化错误: %+v", round, r2)
+			}
+			if len(h.Revisions) != 1 || !h.RetentionEnd.Equal(MustParseDate("2025-02-10")) {
+				t.Fatalf("第 %d 轮：状态不正确: %+v", round, h)
+			}
+		default:
+			t.Logf("第 %d 轮：R-2 先成功", round)
+			if !r1.failed || !contains(r1.message, "已变化") {
+				t.Fatalf("第 %d 轮：后到者应收到期限已变化错误: %+v", round, r1)
+			}
+			if len(h.Revisions) != 1 || !h.RetentionEnd.Equal(MustParseDate("2025-03-10")) {
+				t.Fatalf("第 %d 轮：状态不正确: %+v", round, h)
+			}
+		}
+		check.Close()
+	}
 }

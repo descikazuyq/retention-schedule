@@ -29,6 +29,18 @@ s.Release(retention.ReleaseInput{
     Reason: "结案", ReleasedOn: retention.MustParseDate("2025-01-09"),
 })
 
+// 登记的期限需要调整时，可在销毁前修订截止日，不必重新登记。
+// 提交的原截止日是调用者看到的当前截止日，必须与保管库当前保存值一致。
+r, _ := s.Revise(retention.RevisionInput{
+    RevisionID: "R-1",
+    ArchiveID:  "A-001",
+    OriginalEnd: retention.MustParseDate("2025-01-10"),
+    NewEnd:      retention.MustParseDate("2025-02-10"), // 延长或缩短均可
+    RevisedOn:   retention.MustParseDate("2025-01-15"), // 仅用于记录
+    Reason:      "补充凭证",
+})
+_ = r
+
 // 销毁前可先只做核对：不销毁、不生成清册、不占用申请编号。
 r, _ := s.Check(retention.CheckRequest{
     ApplicationID: "APP-2",
@@ -49,7 +61,7 @@ m, err := s.Destroy(retention.DestructionRequest{
 })
 _ = m
 
-h, found, _ := s.History("A-001") // 登记内容、全部冻结解除历史、销毁状态与清册
+h, found, _ := s.History("A-001") // 登记内容、最初与当前截止日、全部修订历史、全部冻结解除历史、销毁状态与清册
 _, found, _ = s.GetManifest("APP-1")
 ```
 
@@ -57,6 +69,11 @@ _, found, _ = s.GetManifest("APP-1")
 
 - 日期统一 `YYYY-MM-DD`，按日历日期比较，不受时区或夏令时影响；日期必须真实存在。
 - 登记：编号、类别不可空白；截止日不能早于起算日；重复编号明确失败且不影响已有记录。
+- 修订：销毁前可延长或缩短截止日，不必重新登记，编号、类别、起算日不变；被冻结的档案也可修订，但修订不能解除冻结。
+  修订编号与原因去首尾空白后不得为空；新截止日不能早于起算日，也不能等于提交的原截止日。
+  提交的原截止日必须与当前保存值一致，否则返回可区分的期限已变化错误并提供当前截止日。
+  修订编号在全部档案之间唯一，且与销毁申请编号互不占用；同编号同内容重试只返回第一次成功的记录，
+  沿用编号改变任何内容则冲突；失败过的编号仍可重新提交。任何失败都不改变期限或留下修订历史。
 - 冻结：同一档案可有多条，冻结编号同档案内唯一；解除必须填日期和原因，解除日期不早于冻结日期；
   解除只做标记，记录全部保留；不能给不存在或已销毁的档案新增冻结。
 - 核对：销毁前的只读核对，一次看清整批所有阻碍。申请编号尚未成功使用时，按提交顺序逐份给出
