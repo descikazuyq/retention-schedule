@@ -29,14 +29,33 @@ type Manifest struct {
 	Entries       []ManifestEntry
 }
 
+// RevisionRecord 是一条已成功办理的保管截止日修订记录。
+//
+// OldEnd 是修订前生效的截止日，NewEnd 是修订后生效的截止日；
+// RevisedOn 仅用于记录办理日期，提交成功即采用新期限。
+type RevisionRecord struct {
+	RevisionID string
+	ArchiveID  string
+	OldEnd     Date
+	NewEnd     Date
+	RevisedOn  Date
+	Reason     string
+}
+
 // ArchiveHistory 是按档案编号核对时看到的完整历史。
 type ArchiveHistory struct {
-	ID                    string
-	Category              string
-	Start                 Date
+	ID       string
+	Category string
+	Start    Date
+	// InitialEnd 是最初登记时的保管截止日，不随修订改变。
+	InitialEnd Date
+	// RetentionEnd 是当前生效的保管截止日，等于最后一次成功修订的新截止日；
+	// 从未修订过时与 InitialEnd 相同。
 	RetentionEnd          Date
 	Destroyed             bool
 	ManifestApplicationID string
+	// Revisions 包含全部截止日修订记录，按成功办理顺序排列。
+	Revisions []RevisionRecord
 	// Freezes 包含全部冻结及解除历史，按登记顺序排列。
 	Freezes []FreezeRecord
 	// ActiveFreezes 仅包含尚未解除的冻结。
@@ -128,13 +147,24 @@ type CheckReport struct {
 // 以下类型是持久化到磁盘的数据结构，仅在包内使用。
 
 type archiveRecord struct {
-	ID         string          `json:"id"`
-	Category   string          `json:"category"`
-	Start      Date            `json:"start"`
-	End        Date            `json:"end"`
-	Destroyed  bool            `json:"destroyed"`
-	ManifestID string          `json:"manifest_id,omitempty"`
-	Freezes    []*freezeRecord `json:"freezes"`
+	ID         string            `json:"id"`
+	Category   string            `json:"category"`
+	Start      Date              `json:"start"`
+	End        Date              `json:"end"`
+	InitialEnd Date              `json:"initial_end,omitempty"`
+	Destroyed  bool              `json:"destroyed"`
+	ManifestID string            `json:"manifest_id,omitempty"`
+	Freezes    []*freezeRecord   `json:"freezes"`
+	Revisions  []*revisionRecord `json:"revisions,omitempty"`
+}
+
+// revisionRecord 是一条已保存的截止日修订；文本字段保存时均已去除首尾空白。
+type revisionRecord struct {
+	ID        string `json:"id"`
+	OldEnd    Date   `json:"old_end"`
+	NewEnd    Date   `json:"new_end"`
+	RevisedOn Date   `json:"revised_on"`
+	Reason    string `json:"reason"`
 }
 
 type freezeRecord struct {

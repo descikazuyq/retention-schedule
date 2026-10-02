@@ -109,6 +109,13 @@ func (s *Store) load() (*storeData, error) {
 	if data.Manifests == nil {
 		data.Manifests = map[string]*manifestRecord{}
 	}
+	// 兼容引入修订功能之前保存的保管库：没有记录最初截止日时，
+	// 登记截止日就是最初截止日。
+	for _, ar := range data.Archives {
+		if ar.InitialEnd.IsZero() {
+			ar.InitialEnd = ar.End
+		}
+	}
 	return data, nil
 }
 

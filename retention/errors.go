@@ -1,6 +1,9 @@
 package retention
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // 业务规则错误。调用方可用 errors.Is 判断失败类别，具体错误信息会附带上编号等上下文。
 var (
@@ -38,7 +41,28 @@ var (
 	ErrApplicationMismatch = errors.New("retention: 申请编号与已成功的申请不一致")
 	// ErrArchiveAlreadyOnManifest 表示档案已经出现在另一份成功清册中。
 	ErrArchiveAlreadyOnManifest = errors.New("retention: 档案已在其他销毁清册中")
+	// ErrRetentionEndChanged 表示提交的原截止日与当前保存值不一致，期限已被他人改动。
+	ErrRetentionEndChanged = errors.New("retention: 保管截止日已变化")
+	// ErrRevisionConflict 表示修订编号已成功使用但本次内容不同，或与销毁申请编号相互占用。
+	ErrRevisionConflict = errors.New("retention: 修订编号冲突")
+	// ErrRevisionEndUnchanged 表示新截止日与所提交的原截止日相同。
+	ErrRevisionEndUnchanged = errors.New("retention: 新截止日不能等于原截止日")
 )
+
+// RetentionEndChangedError 表示修订提交的原截止日与当前保存值不一致：
+// 首次办理时期限已被他人改动，本次修订未生效。CurrentEnd 给出当前保存的截止日。
+type RetentionEndChangedError struct {
+	ArchiveID  string
+	CurrentEnd Date
+}
+
+func (e *RetentionEndChangedError) Error() string {
+	return fmt.Sprintf("retention: 档案 %s 的保管截止日已变化，当前为 %s: %s",
+		e.ArchiveID, e.CurrentEnd, ErrRetentionEndChanged)
+}
+
+// Is 支持 errors.Is(err, ErrRetentionEndChanged)。
+func (e *RetentionEndChangedError) Is(target error) bool { return target == ErrRetentionEndChanged }
 
 // InvalidDateError 说明 ParseDate 收到的值不是合法的 YYYY-MM-DD 真实日期。
 type InvalidDateError struct {
