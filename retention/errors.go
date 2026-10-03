@@ -47,6 +47,10 @@ var (
 	ErrRevisionConflict = errors.New("retention: 修订编号冲突")
 	// ErrRevisionEndUnchanged 表示新截止日与所提交的原截止日相同。
 	ErrRevisionEndUnchanged = errors.New("retention: 新截止日不能等于原截止日")
+	// ErrStateCorrupt 表示状态文件已存在但内容损坏，无法读取已保存的记录。
+	// 与“尚未建立记录”（文件不存在，可以打开空库）明确区分：
+	// 返回该错误时不会打开可继续办理的保管库，也不会改动原文件。
+	ErrStateCorrupt = errors.New("retention: 状态文件已损坏，无法读取已保存的记录")
 )
 
 // RetentionEndChangedError 表示修订提交的原截止日与当前保存值不一致：

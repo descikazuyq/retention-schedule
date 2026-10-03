@@ -1,6 +1,7 @@
 package retention
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,23 +86,44 @@ func (s *Store) rlock() (func(), error) {
 	}, nil
 }
 
-// load 从磁盘读取最新状态。文件不存在时返回一份空状态。
+// load 从磁盘读取最新状态。文件不存在时返回一份空状态（尚未建立记录）。
+//
+// 文件已存在时，必须完整包含且只包含一个 JSON 对象：零字节、只有空白、
+// 内容为 null 或其他非对象值，以及合法对象后面再拼接第二份 JSON 或
+// 无法解析的文字，都判为损坏并返回 ErrStateCorrupt，整份文件不可用，
+// 绝不只取前一段能解析的内容。读取失败时原文件保持原样。
 func (s *Store) load() (*storeData, error) {
 	data := newStoreData()
-	f, err := os.Open(s.statePath())
+	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return data, nil
 		}
 		return nil, fmt.Errorf("retention: 无法读取状态文件: %w", err)
 	}
-	defer f.Close()
-	if err := json.NewDecoder(f).Decode(data); err != nil {
-		if errors.Is(err, io.EOF) {
-			// 空文件视为空状态。
-			return newStoreData(), nil
-		}
-		return nil, fmt.Errorf("retention: 状态文件已损坏: %w", err)
+	// 正常对象前后的空白、换行可以接受；但去掉空白后必须确有内容。
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("retention: 状态文件内容为空: %w", ErrStateCorrupt)
+	}
+	// 状态必须是一个 JSON 对象；null、数组、字符串、数字等都判为损坏。
+	if trimmed[0] != '{' {
+		return nil, fmt.Errorf("retention: 状态文件内容不是 JSON 对象: %w", ErrStateCorrupt)
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	if err := dec.Decode(data); err != nil {
+		return nil, fmt.Errorf("retention: 状态文件无法解析: %v: %w", err, ErrStateCorrupt)
+	}
+	// 合法对象之后不允许再有任何内容：第二份 JSON 值或无法解析的
+	// 文字都说明文件已损坏，即使前一段的档案与清册能够读出。
+	var extra json.RawMessage
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		// 恰好一份 JSON 对象，符合要求。
+	case err == nil:
+		return nil, fmt.Errorf("retention: 状态文件包含多份 JSON 内容: %w", ErrStateCorrupt)
+	default:
+		return nil, fmt.Errorf("retention: 状态文件尾部含有无法解析的内容: %v: %w", err, ErrStateCorrupt)
 	}
 	if data.Archives == nil {
 		data.Archives = map[string]*archiveRecord{}
