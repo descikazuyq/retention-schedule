@@ -36,7 +36,7 @@ type Store struct {
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
 // 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
-// 对应不上）时返回 ErrCorruptState，
+// 对应不上、最初截止日与修订历史及当前截止日衔接不上）时返回 ErrCorruptState，
 // 不会返回可继续办理的保管库，已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
@@ -110,6 +110,15 @@ func (s *Store) rlock() (func(), error) {
 // 出现在多份清册、归属指向别的申请，或未销毁档案仍挂有清册申请编号，
 // 都说明记录已无法说明档案由哪次申请销毁，整份保管库判为损坏并返回
 // ErrCorruptState，错误信息指明涉及的档案编号与相关申请编号。
+//
+// 每份档案的最初截止日、修订历史与当前截止日还必须连续对应：
+// 修订按成功办理顺序首尾相接，第一条原截止日等于最初截止日，其后每条
+// 原截止日等于上一条新截止日，末次新截止日等于当前截止日；无修订时
+// 最初截止日与当前截止日相同。修订链断开、当前截止日对不上末次修订、
+// 修订列表存在空记录，或已有修订却缺少最初截止日，都判为损坏并返回
+// ErrCorruptState，错误信息指明档案编号，能定位时同时指明修订编号。
+// 仅引入修订功能之前保存、既无最初截止日也无修订历史的旧档案，
+// 才以登记截止日补齐为最初与当前截止日。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -150,12 +159,11 @@ func (s *Store) load() (*storeData, error) {
 	if err := validateManifestConsistency(data); err != nil {
 		return nil, err
 	}
-	// 兼容引入修订功能之前保存的保管库：没有记录最初截止日时，
-	// 登记截止日就是最初截止日。
-	for _, ar := range data.Archives {
-		if ar.InitialEnd.IsZero() {
-			ar.InitialEnd = ar.End
-		}
+	// 最初截止日、按成功办理顺序保留的修订链与当前截止日必须连续对应。
+	// 只有引入修订功能之前保存、既没有最初截止日也没有修订历史的档案，
+	// 才以登记截止日补齐；已有修订却缺少最初截止日同样判为损坏。
+	if err := validateRevisionChains(data); err != nil {
+		return nil, err
 	}
 	return data, nil
 }
@@ -315,6 +323,80 @@ func validateManifestConsistency(data *storeData) error {
 					"retention: 清册 %s 重复收录档案 %s（共 %d 次），记录已损坏: %w",
 					appID, id, seen[id], ErrCorruptState)
 			}
+		}
+	}
+	return nil
+}
+
+// validateRevisionChains 检查库内每份档案的最初截止日、修订历史与当前截止日
+// 是否连续对应。
+//
+// 修订记录按成功办理顺序保存，必须首尾相接：第一条修订的原截止日等于最初
+// 截止日，其后每条修订的原截止日等于上一条修订的新截止日，最后一条修订的
+// 新截止日等于当前截止日。没有修订时，最初截止日必须与当前截止日相同。
+// 修订日期仅用于记录，不决定生效先后，历史绝不按该日期重排；期限曾被延长、
+// 缩短或改回早先用过的日期，只要衔接完整就是合法记录。
+//
+// 兼容引入修订功能之前保存的档案：既没有记录最初截止日、也没有任何修订时，
+// 以登记截止日（当前截止日）作为最初截止日补齐。已有修订却缺少最初截止日，
+// 或最初截止日与无修订时的当前截止日不符，则不能把当前期限冒充最初期限，
+// 按记录损坏处理。修订列表中存在空记录、某条修订的原截止日接不上上一条的
+// 新截止日、末次修订的新截止日与当前截止日不一致，同样说明当前截止日与
+// 修订历史已经无法相互说明，绝不能挑选其中一个日期当作可靠依据，返回可由
+// ErrCorruptState 识别的错误，并在信息中给出档案编号；能对应到具体修订时
+// 同时给出修订编号。校验覆盖整个保管库，与本次办理名单无关。
+func validateRevisionChains(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序后再检查，保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			continue
+		}
+		// 旧记录兼容：没有修订历史时才允许缺少最初截止日，
+		// 此时登记截止日就是最初（也是当前）截止日。
+		if len(ar.Revisions) == 0 {
+			if ar.InitialEnd.IsZero() {
+				ar.InitialEnd = ar.End
+			} else if !ar.InitialEnd.Equal(ar.End) {
+				return fmt.Errorf(
+					"retention: 档案 %s 没有修订历史但最初截止日 %s 与当前截止日 %s 不一致，记录已损坏: %w",
+					id, ar.InitialEnd, ar.End, ErrCorruptState)
+			}
+			continue
+		}
+		if ar.InitialEnd.IsZero() {
+			return fmt.Errorf(
+				"retention: 档案 %s 已有 %d 条修订记录却缺少最初截止日，记录已损坏: %w",
+				id, len(ar.Revisions), ErrCorruptState)
+		}
+		// 按保存的成功顺序逐段核对：每条修订的原截止日必须等于上一条的
+		// 新截止日，第一条对上最初截止日。
+		expected := ar.InitialEnd
+		for i, rec := range ar.Revisions {
+			if rec == nil {
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订列表第 %d 条记录缺失，记录已损坏: %w",
+					id, i+1, ErrCorruptState)
+			}
+			if !rec.OldEnd.Equal(expected) {
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订 %s 的原截止日 %s 接不上上一截止日 %s，修订链已断开，记录已损坏: %w",
+					id, rec.ID, rec.OldEnd, expected, ErrCorruptState)
+			}
+			expected = rec.NewEnd
+		}
+		// 当前截止日必须等于末次修订的新截止日，否则当前值与历史互相矛盾。
+		last := ar.Revisions[len(ar.Revisions)-1]
+		if !last.NewEnd.Equal(ar.End) {
+			return fmt.Errorf(
+				"retention: 档案 %s 的当前截止日 %s 与末次修订 %s 的新截止日 %s 不一致，记录已损坏: %w",
+				id, ar.End, last.ID, last.NewEnd, ErrCorruptState)
 		}
 	}
 	return nil
