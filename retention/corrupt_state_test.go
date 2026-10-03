@@ -462,3 +462,339 @@ func TestCorruptReleaseOnDestroyedArchiveFailsWholeVault(t *testing.T) {
 		t.Fatalf("失败后原保存内容被改动:\n%q", got)
 	}
 }
+
+// validDestroyedState 是一份合法的“档案已销毁、清册已关闭”状态 JSON，
+// 各损坏用例在它的基础上改动。
+const validDestroyedState = `{
+  "version": 1,
+  "archives": {
+    "A-1": {
+      "id": "A-1",
+      "category": "合同",
+      "start": "2020-01-01",
+      "end": "2025-01-10",
+      "initial_end": "2025-01-10",
+      "destroyed": true,
+      "manifest_id": "APP-1",
+      "freezes": []
+    }
+  },
+  "manifests": {
+    "APP-1": {
+      "application_id": "APP-1",
+      "processed_on": "2025-01-10",
+      "entries": [
+        {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10"}
+      ]
+    }
+  }
+}`
+
+// inconsistentStateCase 描述一种销毁状态与关闭清册不能相互对应的损坏记录，
+// want 是错误信息中必须出现的编号（档案编号与相关申请编号）。
+type inconsistentStateCase struct {
+	name string
+	json string
+	want []string
+}
+
+func inconsistentStateCases() []inconsistentStateCase {
+	entryA1 := `{"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10"}`
+	manifestAPP1 := `"APP-1": {"application_id": "APP-1", "processed_on": "2025-01-10", "entries": [` + entryA1 + `]}`
+	return []inconsistentStateCase{
+		{
+			name: "清册仍保留但档案被标成未销毁",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": false, "freezes": []}
+  },
+  "manifests": {` + manifestAPP1 + `}
+}`,
+			want: []string{"A-1", "APP-1"},
+		},
+		{
+			name: "已销毁档案的所属清册缺失",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": true, "manifest_id": "APP-1", "freezes": []}
+  },
+  "manifests": {}
+}`,
+			want: []string{"A-1", "APP-1"},
+		},
+		{
+			name: "已销毁档案没有申请编号",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": true, "freezes": []}
+  },
+  "manifests": {}
+}`,
+			want: []string{"A-1"},
+		},
+		{
+			name: "所属清册未收录该档案",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": true, "manifest_id": "APP-1", "freezes": []}
+  },
+  "manifests": {
+    "APP-1": {"application_id": "APP-1", "processed_on": "2025-01-10", "entries": []}
+  }
+}`,
+			want: []string{"A-1", "APP-1"},
+		},
+		{
+			name: "同一档案在一份清册中出现两次",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": true, "manifest_id": "APP-1", "freezes": []}
+  },
+  "manifests": {
+    "APP-1": {"application_id": "APP-1", "processed_on": "2025-01-10", "entries": [` + entryA1 + `, ` + entryA1 + `]}
+  }
+}`,
+			want: []string{"A-1", "APP-1"},
+		},
+		{
+			name: "同一档案出现在两份不同清册中",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": true, "manifest_id": "APP-1", "freezes": []}
+  },
+  "manifests": {
+    "APP-1": {"application_id": "APP-1", "processed_on": "2025-01-10", "entries": [` + entryA1 + `]},
+    "APP-2": {"application_id": "APP-2", "processed_on": "2025-01-11", "entries": [` + entryA1 + `]}
+  }
+}`,
+			want: []string{"A-1", "APP-1", "APP-2"},
+		},
+		{
+			name: "档案归属指向别的申请编号",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": true, "manifest_id": "APP-2", "freezes": []}
+  },
+  "manifests": {` + manifestAPP1 + `}
+}`,
+			want: []string{"A-1", "APP-2"},
+		},
+		{
+			name: "清册收录了不存在的档案",
+			json: `{
+  "version": 1,
+  "archives": {},
+  "manifests": {` + manifestAPP1 + `}
+}`,
+			want: []string{"A-1", "APP-1"},
+		},
+		{
+			name: "未销毁档案仍挂有清册申请编号",
+			json: `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "initial_end": "2025-01-10", "destroyed": false, "manifest_id": "APP-1", "freezes": []}
+  },
+  "manifests": {` + manifestAPP1 + `}
+}`,
+			want: []string{"A-1", "APP-1"},
+		},
+	}
+}
+
+// 已保存的销毁状态与关闭清册不能相互对应时，即使 JSON 本身能解析，
+// Open 也必须按记录损坏处理：返回 ErrCorruptState，错误信息指出涉及的
+// 档案编号与相关申请编号，原文件保持原样，不返回可继续办理的保管库。
+func TestOpenRejectsInconsistentDestructionRecords(t *testing.T) {
+	for _, tc := range inconsistentStateCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeStateFile(t, dir, tc.json)
+
+			s, err := Open(dir)
+			if err == nil {
+				s.Close()
+				t.Fatal("销毁状态与清册不一致时不应打开成功")
+			}
+			if !errors.Is(err, ErrCorruptState) {
+				t.Fatalf("错误应可判定为 ErrCorruptState，得到 %v", err)
+			}
+			msg := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("错误信息应包含编号 %q，得到 %v", want, err)
+				}
+			}
+			if got := readStateFile(t, dir); got != tc.json {
+				t.Fatalf("打开失败后原文件被改动")
+			}
+		})
+	}
+
+	// 对照组：合法销毁记录必须正常打开，历史与原清册完整可查，
+	// 相同申请再次提交仍取回原清册；引入期限修订前的合法记录
+	// （无 initial_end、无 revisions）也不能仅因缺这些字段被拒绝。
+	t.Run("合法销毁记录可打开且可重放", func(t *testing.T) {
+		dir := t.TempDir()
+		writeStateFile(t, dir, validDestroyedState)
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatalf("合法销毁记录应能打开: %v", err)
+		}
+		defer s.Close()
+		h, found, err := s.History("A-1")
+		if err != nil || !found || !h.Destroyed || h.ManifestApplicationID != "APP-1" || h.Manifest == nil {
+			t.Fatalf("合法销毁历史应完整可查: found=%v err=%v h=%+v", found, err, h)
+		}
+		m, found, err := s.GetManifest("APP-1")
+		if err != nil || !found || len(m.Entries) != 1 || m.Entries[0].ID != "A-1" {
+			t.Fatalf("原清册应可取回: found=%v err=%v m=%+v", found, err, m)
+		}
+		again, err := s.Destroy(DestructionRequest{
+			ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+		})
+		if err != nil || again.ApplicationID != "APP-1" {
+			t.Fatalf("相同申请再次提交应取回原清册: %+v err=%v", again, err)
+		}
+	})
+	t.Run("旧格式合法销毁记录可打开", func(t *testing.T) {
+		legacy := `{
+  "version": 1,
+  "archives": {
+    "A-1": {"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10", "destroyed": true, "manifest_id": "APP-1", "freezes": []}
+  },
+  "manifests": {
+    "APP-1": {"application_id": "APP-1", "processed_on": "2025-01-10", "entries": [{"id": "A-1", "category": "合同", "start": "2020-01-01", "end": "2025-01-10"}]}
+  }
+}`
+		dir := t.TempDir()
+		writeStateFile(t, dir, legacy)
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatalf("旧格式合法销毁记录应能打开: %v", err)
+		}
+		defer s.Close()
+		h, found, err := s.History("A-1")
+		if err != nil || !found || !h.Destroyed || h.Manifest == nil ||
+			!h.InitialEnd.Equal(MustParseDate("2025-01-10")) {
+			t.Fatalf("旧格式销毁历史应完整: found=%v err=%v h=%+v", found, err, h)
+		}
+	})
+}
+
+// 保管库打开后保存内容才出现销毁状态与清册不一致（清册仍在，档案却被改成
+// 未销毁）：下一次使用有效输入的历史查询、清册取回、销毁前核对与正式办理
+// 都必须返回 ErrCorruptState，即使本次操作的是另一份无关档案；不能返回
+// 正常历史、清册或部分核对报告，不能用另一申请编号生成第二份清册，
+// 且失败后原保存内容保持原样。恢复合法内容后原清册仍可重放。
+func TestInconsistentDestructionAfterOpenFailsAllOperations(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "A-2", "凭证", "2020-01-01", "2025-01-10")
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original := readStateFile(t, dir)
+
+	// 损坏：清册 APP-1 仍收录 A-1，但 A-1 被改成未销毁并摘掉归属编号。
+	rewriteState(t, dir, func(doc map[string]any) {
+		a1 := doc["archives"].(map[string]any)["A-1"].(map[string]any)
+		a1["destroyed"] = false
+		delete(a1, "manifest_id")
+	})
+	corruptContent := readStateFile(t, dir)
+
+	// 重新打开整个位置必须失败，错误指出 A-1 与 APP-1。
+	s2, err := Open(dir)
+	if err == nil {
+		s2.Close()
+		t.Fatal("销毁关系损坏时打开必须失败")
+	}
+	if !errors.Is(err, ErrCorruptState) ||
+		!strings.Contains(err.Error(), "A-1") || !strings.Contains(err.Error(), "APP-1") {
+		t.Fatalf("打开错误应为 ErrCorruptState 并指出 A-1/APP-1，得到 %v", err)
+	}
+
+	// 已打开的实例：不得把被改成未销毁的 A-1 重新判为可以销毁。
+	if h, found, err := s.History("A-1"); !errors.Is(err, ErrCorruptState) || found || h.ID != "" {
+		t.Fatalf("损坏后 History(A-1) 必须失败且无结论: found=%v err=%v", found, err)
+	}
+	// 即使本次只操作另一份无关档案 A-2，也必须按整库损坏失败。
+	if h, found, err := s.History("A-2"); !errors.Is(err, ErrCorruptState) || found || h.ID != "" {
+		t.Fatalf("查询无关档案 A-2 也应失败: found=%v err=%v", found, err)
+	}
+	if m, found, err := s.GetManifest("APP-1"); !errors.Is(err, ErrCorruptState) || found || m.ApplicationID != "" {
+		t.Fatalf("取回原清册也必须失败: found=%v m=%+v err=%v", found, m, err)
+	}
+	if r, err := s.Check(CheckRequest{
+		ApplicationID: "APP-2", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) || r.Status != "" || len(r.Results) != 0 {
+		t.Fatalf("损坏档案不得被判为可以办理: %+v err=%v", r, err)
+	}
+	if r, err := s.Check(CheckRequest{
+		ApplicationID: "APP-2", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-2"},
+	}); !errors.Is(err, ErrCorruptState) || r.Status != "" || len(r.Results) != 0 {
+		t.Fatalf("核对无关档案也必须整次失败且无部分报告: %+v err=%v", r, err)
+	}
+	if m, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-2", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) || m.ApplicationID != "" {
+		t.Fatalf("不得用另一申请编号生成第二份清册: %+v err=%v", m, err)
+	}
+	if m, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-2", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-2"},
+	}); !errors.Is(err, ErrCorruptState) || m.ApplicationID != "" {
+		t.Fatalf("办理无关档案也必须失败且不生成清册: %+v err=%v", m, err)
+	}
+	if err := s.Register(RegisterInput{ID: "A-3", Category: "凭证", Start: MustParseDate("2020-01-01"), End: MustParseDate("2025-01-10")}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Register 必须失败: %v", err)
+	}
+	if err := s.Freeze(FreezeInput{ArchiveID: "A-2", FreezeID: "F-1", Reason: "诉讼", FrozenOn: MustParseDate("2025-01-05")}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Freeze 必须失败: %v", err)
+	}
+	if _, err := s.Revise(ReviseInput{
+		RevisionID: "REV-1", ArchiveID: "A-2",
+		OriginalEnd: MustParseDate("2025-01-10"), NewEnd: MustParseDate("2026-01-10"),
+		RevisedOn: MustParseDate("2025-01-07"), Reason: "延长",
+	}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Revise 必须失败: %v", err)
+	}
+
+	// 所有失败都不得触发重新保存：损坏内容原样保留，
+	// 不自动补清册、改销毁标记或删掉冲突记录。
+	if got := readStateFile(t, dir); got != corruptContent {
+		t.Fatalf("失败后原保存内容被改动:\n%q", got)
+	}
+
+	// 恢复合法内容：原清册与销毁历史完整可查，相同申请再次提交取回原清册；
+	// 失败过的 APP-2 没有留下任何东西，可正常用于销毁 A-2。
+	writeStateFile(t, dir, original)
+	h, found, err := s.History("A-1")
+	if err != nil || !found || !h.Destroyed || h.Manifest == nil {
+		t.Fatalf("恢复后 A-1 的销毁历史应完整: found=%v err=%v h=%+v", found, err, h)
+	}
+	if again, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); err != nil || again.ApplicationID != "APP-1" || len(again.Entries) != 1 {
+		t.Fatalf("恢复后相同申请应取回原清册: %+v err=%v", again, err)
+	}
+	if m, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-2", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-2"},
+	}); err != nil || m.ApplicationID != "APP-2" {
+		t.Fatalf("恢复后失败过的申请编号应仍可正常办理: %+v err=%v", m, err)
+	}
+}
