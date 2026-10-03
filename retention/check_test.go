@@ -3,6 +3,7 @@ package retention
 import (
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -214,6 +215,139 @@ func TestCheckReplayableAndConflict(t *testing.T) {
 	r3 := mustCheck(t, s, "APP-1", "2025-01-10", "A-1")
 	if r3.Status != CheckConflict || r3.Manifest == nil || len(r3.Manifest.Entries) != 2 {
 		t.Fatalf("改集合应判冲突并附原清册: %+v", r3)
+	}
+}
+
+func TestCheckRevisionOccupiedApplicationFails(t *testing.T) {
+	s := openTestStore(t)
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "A-2", "凭证", "2020-01-01", "2025-01-10")
+	// A-1 曾用 R-1 成功修订期限。
+	revise(t, s, "R-1", "A-1", "2025-01-10", "2026-01-10", "2024-12-01", "延长")
+
+	// 即使只核对另一份已到期、无冻结的 A-2，申请编号 R-1 也必须在正式提交前
+	// 给出确定的失败，而不是显示“可以办理”。
+	r, err := s.Check(CheckRequest{
+		ApplicationID: "R-1", ProcessedOn: MustParseDate("2025-01-10"),
+		ArchiveIDs: []string{"A-2"},
+	})
+	if !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("已用于成功修订的编号应返回 ErrRevisionConflict，得到 %v", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "期限修订") || !strings.Contains(msg, "R-1") {
+		t.Fatalf("错误应说明编号已用于期限修订并带出冲突编号: %v", err)
+	}
+	// 报告为空：不逐份列结果、不附清册，也不显示可以取回原清册。
+	if r.Status != "" || r.ApplicationID != "" || r.Results != nil || r.Manifest != nil {
+		t.Fatalf("修订占用编号时应返回空报告: %+v", r)
+	}
+
+	// 申请编号按已有方式去除首尾空白后判断，加空格不能绕过冲突。
+	if _, err := s.Check(CheckRequest{
+		ApplicationID: "  R-1\t", ProcessedOn: MustParseDate("2025-01-10"),
+		ArchiveIDs: []string{"A-2"},
+	}); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("首尾空白不应绕过修订编号冲突，得到 %v", err)
+	}
+
+	// 甲档案后来再次修订（R-2）不释放 R-1。
+	revise(t, s, "R-2", "A-1", "2026-01-10", "2026-06-30", "2025-01-05", "再次延长")
+	if _, err := s.Check(CheckRequest{
+		ApplicationID: "R-1", ProcessedOn: MustParseDate("2025-01-10"),
+		ArchiveIDs: []string{"A-2"},
+	}); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("原档案再次修订不应释放原编号 R-1，得到 %v", err)
+	}
+
+	// 甲档案后来已经销毁，R-1 仍被占用。
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "D-1", ProcessedOn: MustParseDate("2026-07-01"),
+		ArchiveIDs: []string{"A-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Check(CheckRequest{
+		ApplicationID: "R-1", ProcessedOn: MustParseDate("2026-07-01"),
+		ArchiveIDs: []string{"A-2"},
+	}); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("原档案销毁不应释放修订编号 R-1，得到 %v", err)
+	}
+
+	// 核对全程只读：没有生成清册，也没有改动修订历史。
+	if _, found, err := s.GetManifest("R-1"); err != nil || found {
+		t.Fatalf("核对不应生成 R-1 清册，found=%v err=%v", found, err)
+	}
+	h, found, err := s.History("A-1")
+	if err != nil || !found || len(h.Revisions) != 2 {
+		t.Fatalf("核对不应改动修订历史: found=%v err=%v h=%+v", found, err, h.Revisions)
+	}
+
+	// 换用未占用编号后仍按现有规则逐份检查：未到期与未解除冻结仍可同时显示。
+	if err := s.Freeze(FreezeInput{
+		ArchiveID: "A-2", FreezeID: "F-1", Reason: "诉讼",
+		FrozenOn: MustParseDate("2025-01-09"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := s.Check(CheckRequest{
+		ApplicationID: "FREE-ID", ProcessedOn: MustParseDate("2025-01-09"),
+		ArchiveIDs: []string{"A-2"},
+	})
+	if err != nil {
+		t.Fatalf("未占用编号应正常核对: %v", err)
+	}
+	if r2.Status != CheckBlocked {
+		t.Fatalf("未到期且有冻结应判存在阻碍，得到 %s", r2.Status)
+	}
+	if kinds := obstructionKinds(r2.Results[0]); len(kinds) != 2 ||
+		kinds[0] != ObstructionNotExpired || kinds[1] != ObstructionActiveFreeze {
+		t.Fatalf("未到期与未解除冻结应并列显示: %+v", r2.Results[0].Obstructions)
+	}
+}
+
+func TestCheckFailedRevisionDoesNotOccupyApplication(t *testing.T) {
+	s := openTestStore(t)
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	// R-1 先成功修订。
+	revise(t, s, "R-1", "A-1", "2025-01-10", "2026-01-10", "2024-12-01", "延长")
+	// R-FAIL 因原截止日已变化而失败，不留修订记录。
+	if _, err := s.Revise(ReviseInput{
+		RevisionID: "R-FAIL", ArchiveID: "A-1",
+		OriginalEnd: MustParseDate("2025-01-10"), // 当前截止日已是 2026-01-10
+		NewEnd:      MustParseDate("2027-01-10"),
+		RevisedOn:   MustParseDate("2024-12-20"), Reason: "再延长",
+	}); !errors.Is(err, ErrRetentionEndChanged) {
+		t.Fatalf("前置失败修订应因期限变化失败，得到 %v", err)
+	}
+
+	// 曾提交但失败的编号不占用：核对一份已到期、无冻结档案应可以办理。
+	r := mustCheck(t, s, "R-FAIL", "2026-01-10", "A-1")
+	if r.Status != CheckReady {
+		t.Fatalf("失败修订的编号不应占用，应可以办理，得到 %s", r.Status)
+	}
+
+	// 输入错误仍按原有类别失败，不因编号碰巧被占用而改变。
+	validOn := MustParseDate("2026-01-10")
+	cases := []struct {
+		name string
+		req  CheckRequest
+		want error
+	}{
+		{"空白编号", CheckRequest{ApplicationID: "  ", ProcessedOn: validOn, ArchiveIDs: []string{"A-1"}}, ErrBlankField},
+		{"缺失日期", CheckRequest{ApplicationID: "R-1", ArchiveIDs: []string{"A-1"}}, ErrInvalidDate},
+		{"空名单", CheckRequest{ApplicationID: "R-1", ProcessedOn: validOn, ArchiveIDs: nil}, ErrEmptyDestructionList},
+		{"重复选择", CheckRequest{ApplicationID: "R-1", ProcessedOn: validOn, ArchiveIDs: []string{"A-1", "A-1"}}, ErrDuplicateSelection},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := s.Check(tc.req)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("应失败 %v，得到 %v", tc.want, err)
+			}
+			if r.Status != "" || r.Results != nil || r.Manifest != nil {
+				t.Fatalf("输入校验失败时不得返回部分报告: %+v", r)
+			}
+		})
 	}
 }
 

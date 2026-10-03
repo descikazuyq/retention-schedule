@@ -57,6 +57,12 @@ func validateBatchInputs(applicationID string, processedOn Date, rawIDs []string
 //     （顺序无关）与原申请相同，Manifest 返回原清册，不因档案已销毁而判受阻；
 //   - CheckConflict 申请编号冲突：沿用该编号但改变了日期或集合，Manifest 附原清册。
 //
+// 申请编号已被本保管库内任意一条成功的期限修订使用时，编号占用属于整个保管库、
+// 与本次选中的档案无关，核对在逐份检查之前即整体失败，返回的错误可用
+// errors.Is(err, ErrRevisionConflict) 识别，错误信息说明该编号已用于期限修订
+// 并带出冲突编号；此时返回的报告为空，不列出逐份档案结果，也不附清册。
+// 只有成功修订才占用编号：失败的修订不留记录，核对不会仅因编号曾被提交而拒绝。
+//
 // 到期与冻结判断与 Destroy 完全一致：处理日期达到截止日当天即到期，
 // 任一未解除冻结都会阻止销毁，已解除记录不作为阻碍。
 //
@@ -75,13 +81,7 @@ func (s *Store) Check(req CheckRequest) (CheckReport, error) {
 
 	var report CheckReport
 	err = s.view(func(data *storeData) error {
-		report = CheckReport{
-			ApplicationID: appID,
-			ProcessedOn:   req.ProcessedOn,
-			Results:       make([]ArchiveCheckResult, 0, len(ids)),
-		}
-
-		// 申请编号已成功使用：只判断能否取回原清册或编号冲突，两者都附原清册。
+		// 申请编号已成功用于销毁：只判断能否取回原清册或编号冲突，两者都附原清册。
 		// 原清册取自当前这一次状态读取，与下面逐份核对看到的记录同源。
 		if existing, ok := data.Manifests[appID]; ok {
 			m := manifestFromRecord(existing)
@@ -92,6 +92,22 @@ func (s *Store) Check(req CheckRequest) (CheckReport, error) {
 				report.Status = CheckConflict
 			}
 			return nil
+		}
+
+		// 申请编号已被任意一条成功的期限修订占用：编号占用属于整个保管库，
+		// 与本次选中的档案无关（甲档案用 R-1 成功修订后，即使只核对乙档案，
+		// R-1 也不能使用；甲档案后来再次修订或已销毁也不释放原编号）。
+		// 此时在逐份核对之前整体失败：报告为空，不列逐份结果也不附清册。
+		// findRevision 只找得到成功修订：失败的修订不留记录，不会因此被拒。
+		if _, rec := findRevision(data, appID); rec != nil {
+			return fmt.Errorf("retention: 申请编号 %s 已用于期限修订，冲突编号 %s: %w",
+				appID, rec.ID, ErrRevisionConflict)
+		}
+
+		report = CheckReport{
+			ApplicationID: appID,
+			ProcessedOn:   req.ProcessedOn,
+			Results:       make([]ArchiveCheckResult, 0, len(ids)),
 		}
 
 		// 申请编号尚未成功使用：按提交顺序逐份核对，每份列出全部适用阻碍。
