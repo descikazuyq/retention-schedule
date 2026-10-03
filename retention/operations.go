@@ -381,24 +381,13 @@ func (s *Store) Destroy(req DestructionRequest) (Manifest, error) {
 		}
 
 		// 逐份校验，任一不符合条件则整体放弃（此时尚未改动任何记录）。
+		// 可销毁判断与 Check 共用 archiveObstructions，两处结论一致；
+		// 按提交顺序在第一份不能办理的档案处失败，同一档案的多个问题
+		// 按 不存在、已销毁、未到期、未解除冻结 的既有先后报出第一个。
 		for _, id := range ids {
-			ar, ok := data.Archives[id]
-			if !ok {
-				return fmt.Errorf("retention: 档案 %s 不存在: %w", id, ErrNotFound)
-			}
-			if ar.Destroyed {
-				return fmt.Errorf("retention: 档案 %s 已在清册 %s 中，不能再次销毁: %w",
-					id, ar.ManifestID, ErrArchiveAlreadyOnManifest)
-			}
-			if req.ProcessedOn.Before(ar.End) {
-				return fmt.Errorf("retention: 档案 %s 尚未到期（截止日 %s，处理日期 %s）: %w",
-					id, ar.End, req.ProcessedOn, ErrNotExpired)
-			}
-			for _, f := range ar.Freezes {
-				if !f.Released {
-					return fmt.Errorf("retention: 档案 %s 有未解除的冻结 %s: %w",
-						id, f.ID, ErrActiveFreeze)
-				}
+			ar, obstructions := archiveObstructions(data, id, req.ProcessedOn)
+			if len(obstructions) > 0 {
+				return obstructionError(id, ar, obstructions[0], req.ProcessedOn)
 			}
 		}
 

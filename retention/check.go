@@ -42,6 +42,71 @@ func validateBatchInputs(applicationID string, processedOn Date, rawIDs []string
 	return appID, ids, seen, nil
 }
 
+// archiveObstructions 是可销毁判断的唯一实现，Check 与 Destroy 共用：
+// 同一档案在相同保存状态、相同处理日期下，两处得出一致的结论。
+//
+// 返回档案记录（编号不存在时为 nil）和按固定顺序排列的全部阻碍：
+// 编号不存在；已销毁（附所属清册的申请编号和处理日期）；未到期；
+// 每条未解除冻结各一条，顺序沿用冻结历史登记顺序，带编号、原因和冻结日期。
+// 到期判断采用当前生效的保管截止日（期限修订后即修订后的日期），
+// 处理日期早于截止日时未到期，截止日当天即视为到期；
+// 已解除的冻结保留在历史中，但不构成阻碍。
+func archiveObstructions(data *storeData, id string, processedOn Date) (*archiveRecord, []CheckObstruction) {
+	ar, ok := data.Archives[id]
+	if !ok {
+		return nil, []CheckObstruction{{Kind: ObstructionMissing}}
+	}
+	if ar.Destroyed {
+		// 已销毁档案只有已销毁一条阻碍，附所属清册的申请编号和处理日期。
+		obs := CheckObstruction{Kind: ObstructionDestroyed}
+		if rec, ok := data.Manifests[ar.ManifestID]; ok {
+			obs.ManifestApplicationID = rec.ApplicationID
+			obs.ProcessedOn = rec.ProcessedOn
+		} else {
+			obs.ManifestApplicationID = ar.ManifestID
+		}
+		return ar, []CheckObstruction{obs}
+	}
+	// 未到期与未解除冻结可能同时成立，两类问题都要列出。
+	var obstructions []CheckObstruction
+	if processedOn.Before(ar.End) {
+		obstructions = append(obstructions, CheckObstruction{Kind: ObstructionNotExpired})
+	}
+	for _, f := range ar.Freezes {
+		if f.Released {
+			continue
+		}
+		obstructions = append(obstructions, CheckObstruction{
+			Kind: ObstructionActiveFreeze,
+			Freeze: ActiveFreezeInfo{
+				FreezeID: f.ID,
+				Reason:   f.Reason,
+				FrozenOn: f.FrozenOn,
+			},
+		})
+	}
+	return ar, obstructions
+}
+
+// obstructionError 把 archiveObstructions 发现的第一条阻碍转换为 Destroy 的失败错误。
+// 判断先后维持 不存在、已销毁、未到期、未解除冻结 的既有顺序，
+// 错误中保留定位档案或冻结的信息；ar 在编号不存在时为 nil。
+func obstructionError(id string, ar *archiveRecord, obs CheckObstruction, processedOn Date) error {
+	switch obs.Kind {
+	case ObstructionMissing:
+		return fmt.Errorf("retention: 档案 %s 不存在: %w", id, ErrNotFound)
+	case ObstructionDestroyed:
+		return fmt.Errorf("retention: 档案 %s 已在清册 %s 中，不能再次销毁: %w",
+			id, ar.ManifestID, ErrArchiveAlreadyOnManifest)
+	case ObstructionNotExpired:
+		return fmt.Errorf("retention: 档案 %s 尚未到期（截止日 %s，处理日期 %s）: %w",
+			id, ar.End, processedOn, ErrNotExpired)
+	default: // ObstructionActiveFreeze
+		return fmt.Errorf("retention: 档案 %s 有未解除的冻结 %s: %w",
+			id, obs.Freeze.FreezeID, ErrActiveFreeze)
+	}
+}
+
 // Check 在正式办理销毁前做一次只读核对。
 //
 // 调用者提交申请编号、处理日期和档案编号名单，得到整批申请能否办理的报告，
@@ -107,55 +172,22 @@ func (s *Store) Check(req CheckRequest) (CheckReport, error) {
 		}
 
 		// 申请编号尚未成功使用：按提交顺序逐份核对，每份列出全部适用阻碍。
+		// 可销毁判断与 Destroy 共用 archiveObstructions，两处结论一致。
 		anyBlocked := false
 		for _, id := range ids {
 			r := ArchiveCheckResult{ID: id, Obstructions: []CheckObstruction{}}
-			ar, ok := data.Archives[id]
-			if !ok {
-				// 不存在的编号单独标明，不中断其他档案的核对。
-				r.Obstructions = append(r.Obstructions, CheckObstruction{Kind: ObstructionMissing})
-				anyBlocked = true
-				report.Results = append(report.Results, r)
-				continue
+			ar, obstructions := archiveObstructions(data, id, req.ProcessedOn)
+			if ar != nil {
+				r.Exists = true
+				r.Category = ar.Category
+				r.Start = ar.Start
+				r.End = ar.End
+				r.Destroyed = ar.Destroyed
 			}
-			r.Exists = true
-			r.Category = ar.Category
-			r.Start = ar.Start
-			r.End = ar.End
-			r.Destroyed = ar.Destroyed
-
-			if ar.Destroyed {
-				// 已销毁档案给出所属清册的申请编号和处理日期。
-				obs := CheckObstruction{Kind: ObstructionDestroyed}
-				if rec, ok := data.Manifests[ar.ManifestID]; ok {
-					obs.ManifestApplicationID = rec.ApplicationID
-					obs.ProcessedOn = rec.ProcessedOn
-				} else {
-					obs.ManifestApplicationID = ar.ManifestID
-				}
-				r.Obstructions = append(r.Obstructions, obs)
+			// 不存在的编号单独标明，不中断其他档案的核对。
+			r.Obstructions = append(r.Obstructions, obstructions...)
+			if len(obstructions) > 0 {
 				anyBlocked = true
-			} else {
-				// 未到期与未解除冻结可能同时成立，两类问题都要列出。
-				if req.ProcessedOn.Before(ar.End) {
-					r.Obstructions = append(r.Obstructions, CheckObstruction{Kind: ObstructionNotExpired})
-					anyBlocked = true
-				}
-				// 每条未解除冻结各成一条阻碍，顺序沿用冻结历史（登记顺序）。
-				for _, f := range ar.Freezes {
-					if f.Released {
-						continue
-					}
-					r.Obstructions = append(r.Obstructions, CheckObstruction{
-						Kind: ObstructionActiveFreeze,
-						Freeze: ActiveFreezeInfo{
-							FreezeID: f.ID,
-							Reason:   f.Reason,
-							FrozenOn: f.FrozenOn,
-						},
-					})
-					anyBlocked = true
-				}
 			}
 			report.Results = append(report.Results, r)
 		}
