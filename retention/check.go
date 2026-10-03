@@ -57,6 +57,11 @@ func validateBatchInputs(applicationID string, processedOn Date, rawIDs []string
 //     （顺序无关）与原申请相同，Manifest 返回原清册，不因档案已销毁而判受阻；
 //   - CheckConflict 申请编号冲突：沿用该编号但改变了日期或集合，Manifest 附原清册。
 //
+// 申请编号已被本保管库内任意一条成功的期限修订占用时（与本次选中的档案无关，
+// 该档案后来再次修订或已销毁都不释放编号），整次核对明确失败，返回
+// ErrRevisionConflict，报告为空——不列出逐份档案结果，也不附清册。
+// 只有成功修订才占用编号；失败过的修订提交不影响核对。
+//
 // 到期与冻结判断与 Destroy 完全一致：处理日期达到截止日当天即到期，
 // 任一未解除冻结都会阻止销毁，已解除记录不作为阻碍。
 //
@@ -92,6 +97,13 @@ func (s *Store) Check(req CheckRequest) (CheckReport, error) {
 				report.Status = CheckConflict
 			}
 			return nil
+		}
+
+		// 申请编号已被任意一条成功的期限修订占用：整次核对失败，报告为空。
+		// 编号占用属于整个保管库，与本次选中的档案无关；失败过的修订不占用编号。
+		if _, rec := findRevision(data, appID); rec != nil {
+			return fmt.Errorf("retention: 申请编号 %s 已用于期限修订: %w",
+				appID, ErrRevisionConflict)
 		}
 
 		// 申请编号尚未成功使用：按提交顺序逐份核对，每份列出全部适用阻碍。
