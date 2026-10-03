@@ -36,7 +36,8 @@ type Store struct {
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
 // 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
-// 对应不上、修订记录衔接不上、成功修订编号在保存历史中不唯一或与已关闭
+// 对应不上、已关闭清册条目的类别或起算日或保管截止日与档案记录不一致、
+// 修订记录衔接不上、成功修订编号在保存历史中不唯一或与已关闭
 // 清册的申请编号相同）时返回 ErrCorruptState，
 // 不会返回可继续办理的保管库，已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
@@ -129,6 +130,17 @@ func (s *Store) rlock() (func(), error) {
 // 判为损坏并返回 ErrCorruptState；绝不合并记录或挑选其中一条继续使用。
 // 错误信息指明冲突编号：同档案重复时指出该档案，跨档案重复时指出两份
 // 档案，与清册冲突时指出修订所属档案与清册申请编号。
+//
+// 双向归属正确还不够：已关闭清册记录的是每份档案销毁成功那一刻的登记
+// 内容，其中每个条目的类别、起算日、保管截止日都必须与对应档案记录完全
+// 一致；截止日必须是该档案销毁时最终生效的截止日（即当前截止日，等于
+// 末次成功修订的新截止日），不能拿最初登记的截止日代替——期限曾被延长、
+// 缩短或改回早先用过的日期，都以销毁时最终生效值为准，不按修订办理日期
+// 重新选择。三项中任意一项对不上，清册与档案就是两份相互矛盾的历史，
+// 整份保管库判为损坏并返回 ErrCorruptState；绝不挑选其中一份继续使用，
+// 也不靠覆盖清册、改动档案或删除记录消除差异。错误信息指明清册申请编号、
+// 档案编号与具体不一致的项目（类别、起算日、保管截止日，并给出两处各自
+// 的值）；一份清册收录多份档案时任一条目矛盾，本次读取即整体失败。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -185,6 +197,12 @@ func (s *Store) load() (*storeData, error) {
 	// 成功修订编号在整个保管库内只能对应一条保存的修订记录，且不能与
 	// 已关闭清册的申请编号相同——与办理时全库唯一、编号互不占用的要求一致。
 	if err := validateRevisionIDs(data); err != nil {
+		return nil, err
+	}
+	// 已关闭清册中每份档案的条目快照必须与档案记录一致：类别、起算日、
+	// 保管截止日三项逐字相同，截止日取销毁时最终生效的值。归属关系正确
+	// 但快照内容对不上时，同样没有可信记录，整库判为损坏。
+	if err := validateManifestEntryContent(data); err != nil {
 		return nil, err
 	}
 	return data, nil
@@ -344,6 +362,65 @@ func validateManifestConsistency(data *storeData) error {
 				return fmt.Errorf(
 					"retention: 清册 %s 重复收录档案 %s（共 %d 次），记录已损坏: %w",
 					appID, id, seen[id], ErrCorruptState)
+			}
+		}
+	}
+	return nil
+}
+
+// validateManifestEntryContent 检查每份已关闭清册中保存的条目快照是否与
+// 对应档案记录一致。
+//
+// 调用前 validateManifestConsistency 必须已经通过：清册与已销毁档案之间
+// 双向归属正确（清册收录的档案存在、已销毁并指回该清册，且恰好收录一次）。
+// 归属正确只解决“档案由哪次申请销毁”，还要解决“销毁那一刻登记内容是什么”：
+// 已关闭清册是销毁成功时的不可更改快照，其中每个条目的类别、起算日、
+// 保管截止日都必须与档案当前保存的这三项逐字一致。销毁后期限不能再修订，
+// 因此档案的当前截止日就是销毁时最终生效的截止日（等于末次成功修订的
+// 新截止日）；清册保存最初登记的截止日而不是最终生效值同样不合法——
+// 期限被延长、缩短或改回早先用过的日期，都只以最终生效值为准，绝不按
+// 修订办理日期重新挑选期限。
+//
+// 三项中任意一项不一致时，清册与档案就是两份相互矛盾的历史：不挑选其中
+// 一份作为可信记录继续使用，也不靠覆盖清册、修改档案或删除记录消除差异，
+// 返回可由 ErrCorruptState 识别的错误。错误信息给出清册申请编号、档案
+// 编号与全部不一致的项目（类别、起算日、保管截止日）及两处各自的值。
+// 一份清册收录多份档案时，任一条目出现矛盾即整库失败，不会放过其余条目。
+// 校验覆盖整个保管库，与本次办理名单或查询目标无关。
+func validateManifestEntryContent(data *storeData) error {
+	// map 遍历顺序不稳定，按申请编号排序后再检查，保证错误信息稳定。
+	appIDs := make([]string, 0, len(data.Manifests))
+	for appID := range data.Manifests {
+		appIDs = append(appIDs, appID)
+	}
+	sort.Strings(appIDs)
+	for _, appID := range appIDs {
+		rec := data.Manifests[appID]
+		if rec == nil {
+			// 缺失的清册记录已由 validateManifestConsistency 报告。
+			continue
+		}
+		for _, e := range rec.Entries {
+			// 双向归属已由 validateManifestConsistency 保证：档案存在、
+			// 已销毁且指回本清册。这里只需比较快照内容。
+			ar := data.Archives[e.ID]
+			if ar == nil {
+				continue
+			}
+			var diffs []string
+			if e.Category != ar.Category {
+				diffs = append(diffs, fmt.Sprintf("类别：清册为 %q，档案为 %q", e.Category, ar.Category))
+			}
+			if !e.Start.Equal(ar.Start) {
+				diffs = append(diffs, fmt.Sprintf("起算日：清册为 %s，档案为 %s", e.Start, ar.Start))
+			}
+			if !e.End.Equal(ar.End) {
+				diffs = append(diffs, fmt.Sprintf("保管截止日：清册为 %s，档案为 %s", e.End, ar.End))
+			}
+			if len(diffs) > 0 {
+				return fmt.Errorf(
+					"retention: 清册 %s 中档案 %s 的条目与档案登记内容不一致（%s），记录已损坏: %w",
+					appID, e.ID, strings.Join(diffs, "；"), ErrCorruptState)
 			}
 		}
 	}
