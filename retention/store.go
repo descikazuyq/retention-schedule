@@ -1,10 +1,10 @@
 package retention
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -30,7 +30,10 @@ type Store struct {
 }
 
 // Open 打开（或创建）一个本地保存位置。
-// 目录不存在时会创建；状态文件损坏时返回错误，已有记录不会被覆盖。
+// 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
+// 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
+// 还拼接了其他内容等）时返回 ErrCorruptState，不会返回可继续办理的保管库，
+// 已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("retention: 保存位置不能为空")
@@ -85,23 +88,33 @@ func (s *Store) rlock() (func(), error) {
 	}, nil
 }
 
-// load 从磁盘读取最新状态。文件不存在时返回一份空状态。
+// load 从磁盘读取最新状态。文件不存在时返回一份空状态（尚未建立记录）。
+//
+// 文件已经存在时，必须完整包含且只包含一个 JSON 对象（前后允许空白）：
+// 零字节或只有空白的文件、内容为 null 的文件、合法对象后面还拼接了
+// 第二个 JSON 值或无法解析的文字，都判为损坏并返回 ErrCorruptState，
+// 绝不只使用前一段内容，也不会改动原文件。
 func (s *Store) load() (*storeData, error) {
-	data := newStoreData()
-	f, err := os.Open(s.statePath())
+	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return data, nil
+			return newStoreData(), nil
 		}
 		return nil, fmt.Errorf("retention: 无法读取状态文件: %w", err)
 	}
-	defer f.Close()
-	if err := json.NewDecoder(f).Decode(data); err != nil {
-		if errors.Is(err, io.EOF) {
-			// 空文件视为空状态。
-			return newStoreData(), nil
-		}
-		return nil, fmt.Errorf("retention: 状态文件已损坏: %w", err)
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("retention: 状态文件为空或只有空白: %w", ErrCorruptState)
+	}
+	// json.Unmarshal 对 null 不报错且保持目标不变，必须单独拒绝。
+	if string(trimmed) == "null" {
+		return nil, fmt.Errorf("retention: 状态文件内容为 null，不是有效的保管库记录: %w", ErrCorruptState)
+	}
+	data := newStoreData()
+	// json.Unmarshal 要求整个输入恰好是一个 JSON 值：
+	// 合法对象后面再拼接任何内容都会在这里报错。
+	if err := json.Unmarshal(raw, data); err != nil {
+		return nil, fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
 	}
 	if data.Archives == nil {
 		data.Archives = map[string]*archiveRecord{}
