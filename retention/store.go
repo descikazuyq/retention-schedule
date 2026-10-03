@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -32,8 +34,9 @@ type Store struct {
 // Open 打开（或创建）一个本地保存位置。
 // 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
-// 还拼接了其他内容等）时返回 ErrCorruptState，不会返回可继续办理的保管库，
-// 已有记录保持原样，不会被清空、修补或覆盖。
+// 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
+// 缺少解除原因或解除日期、解除日期早于冻结日期）时返回 ErrCorruptState，
+// 不会返回可继续办理的保管库，已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("retention: 保存位置不能为空")
@@ -94,6 +97,11 @@ func (s *Store) rlock() (func(), error) {
 // 零字节或只有空白的文件、内容为 null 的文件、合法对象后面还拼接了
 // 第二个 JSON 值或无法解析的文字，都判为损坏并返回 ErrCorruptState，
 // 绝不只使用前一段内容，也不会改动原文件。
+//
+// JSON 能解析不代表记录合法：任何已解除冻结都必须同时带有非空白的
+// 解除原因和有效的解除日期，且解除日期不早于冻结日期——与解除功能
+// 办理时的要求一致。缺少任一信息或日期顺序不成立时，整份保管库同样
+// 判为损坏并返回 ErrCorruptState，错误信息指明涉及的档案与冻结编号。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -122,6 +130,13 @@ func (s *Store) load() (*storeData, error) {
 	if data.Manifests == nil {
 		data.Manifests = map[string]*manifestRecord{}
 	}
+	// 语义校验先于任何兼容处理：已解除冻结必须与既有解除功能遵守同一要求——
+	// 解除原因与解除日期齐备，且解除日期不早于冻结日期。
+	// 只有“已解除”标记而缺少任一信息，或解除日期早于冻结日期的记录
+	// 一律判为损坏（即使所属档案已销毁）；绝不据此继续办理或修补记录。
+	if err := validateFreezeReleaseRecords(data); err != nil {
+		return nil, err
+	}
 	// 兼容引入修订功能之前保存的保管库：没有记录最初截止日时，
 	// 登记截止日就是最初截止日。
 	for _, ar := range data.Archives {
@@ -130,6 +145,60 @@ func (s *Store) load() (*storeData, error) {
 		}
 	}
 	return data, nil
+}
+
+// validateFreezeReleaseRecords 检查库内全部已解除冻结记录是否完整合法。
+//
+// 正常解除保存的记录必然同时带有非空白的解除原因和有效的解除日期，
+// 且解除日期不早于冻结日期。缺少解除原因、解除日期缺失或为 null、
+// 解除日期早于冻结日期，都说明保存内容已损坏，返回可由 ErrCorruptState
+// 识别的错误，并在信息中给出涉及的档案编号与冻结编号，便于定位记录。
+// 校验覆盖整个保管库的全部已解除冻结，与本次办理名单无关：
+// 即使异常记录所属档案已经销毁，也不能把不完整的解除信息当作正常历史。
+// 未解除冻结没有解除日期和原因是合法状态，不在此报错。
+func validateFreezeReleaseRecords(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序后再检查，保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			return fmt.Errorf("retention: 档案 %s 的登记记录缺失，状态文件已损坏: %w",
+				id, ErrCorruptState)
+		}
+		for _, fr := range ar.Freezes {
+			if fr == nil {
+				return fmt.Errorf("retention: 档案 %s 下存在缺失的冻结记录，状态文件已损坏: %w",
+					id, ErrCorruptState)
+			}
+			if !fr.Released {
+				// 未解除冻结没有解除日期与原因是合法状态。
+				continue
+			}
+			switch {
+			case strings.TrimSpace(fr.ReleaseReason) == "":
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 标记为已解除但缺少解除原因，记录已损坏: %w",
+					id, fr.ID, ErrCorruptState)
+			case fr.ReleasedOn == nil:
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 标记为已解除但缺少解除日期，记录已损坏: %w",
+					id, fr.ID, ErrCorruptState)
+			case fr.ReleasedOn.IsZero():
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 的解除日期无效，记录已损坏: %w",
+					id, fr.ID, ErrCorruptState)
+			case fr.ReleasedOn.Before(fr.FrozenOn):
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 的解除日期 %s 早于冻结日期 %s，记录已损坏: %w",
+					id, fr.ID, fr.ReleasedOn, fr.FrozenOn, ErrCorruptState)
+			}
+		}
+	}
+	return nil
 }
 
 // save 原子地写入状态：先写同目录临时文件并刷盘，再 rename 替换，最后刷目录。
