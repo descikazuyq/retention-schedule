@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -179,5 +180,143 @@ func TestOpenLegacyStateWithoutRevisionFields(t *testing.T) {
 	}
 	if !h.InitialEnd.Equal(MustParseDate("2025-01-10")) || !h.RetentionEnd.Equal(MustParseDate("2025-01-10")) {
 		t.Fatalf("缺少修订信息时最初截止日应取登记截止日: %+v", h)
+	}
+}
+
+// 已解除冻结的解除信息不完整（原因空白、日期缺失或早于冻结日期）时，
+// Open 必须明确失败并判定为 ErrCorruptState，错误中带档案与冻结编号，
+// 原文件保持原样。
+func TestOpenRejectsIncompleteReleaseInfo(t *testing.T) {
+	freeze := func(extra string) string {
+		return `{"version":1,"archives":{"A-1":{"id":"A-1","category":"合同","start":"2020-01-01","end":"2025-01-10","destroyed":false,"freezes":[{"id":"F-1","reason":"诉讼","frozen_on":"2025-01-05","released":true` + extra + `}]}},"manifests":{}}`
+	}
+	corrupt := map[string]string{
+		"解除原因缺失":   freeze(``),
+		"解除原因只有空白": freeze(`,"release_reason":"  "`),
+		"解除日期缺失":   freeze(`,"release_reason":"结案"`),
+		"解除日期为 null": freeze(`,"release_reason":"结案","released_on":null`),
+		"解除日期早于冻结日期": freeze(`,"release_reason":"结案","released_on":"2025-01-04"`),
+	}
+	for name, content := range corrupt {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeStateFile(t, dir, content)
+
+			s, err := Open(dir)
+			if err == nil {
+				s.Close()
+				t.Fatalf("解除信息不完整 %q 不应打开成功", content)
+			}
+			if !errors.Is(err, ErrCorruptState) {
+				t.Fatalf("错误应可判定为 ErrCorruptState，得到 %v", err)
+			}
+			for _, want := range []string{"A-1", "F-1"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("错误应包含 %s 以便定位记录: %v", want, err)
+				}
+			}
+			if got := readStateFile(t, dir); got != content {
+				t.Fatalf("打开失败后原文件被改动: %q -> %q", content, got)
+			}
+		})
+	}
+}
+
+// 打开后保存内容出现不完整的解除信息：下一次查询、核对与办理都必须
+// 返回记录损坏错误，且异常记录不在本次名单中、所属档案已销毁时同样适用；
+// 原文件保持原样。
+func TestIncompleteReleaseInfoFailsSubsequentOperations(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "A-2", "凭证", "2020-01-01", "2025-01-10")
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-0", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	original := readStateFile(t, dir)
+	// 已销毁档案 A-2 上补一条解除信息不完整的冻结；A-1 保持正常。
+	corrupt := `{"version":1,"archives":{` +
+		`"A-1":{"id":"A-1","category":"合同","start":"2020-01-01","end":"2025-01-10","initial_end":"2025-01-10","destroyed":false,"freezes":[]},` +
+		`"A-2":{"id":"A-2","category":"凭证","start":"2020-01-01","end":"2025-01-10","initial_end":"2025-01-10","destroyed":true,"manifest_id":"APP-0",` +
+		`"freezes":[{"id":"F-9","reason":"诉讼","frozen_on":"2024-06-01","released":true,"release_reason":"结案"}]}},` +
+		`"manifests":{"APP-0":{"application_id":"APP-0","processed_on":"2025-01-10","entries":[{"id":"A-2","category":"凭证","start":"2020-01-01","end":"2025-01-10"}]}}}`
+	writeStateFile(t, dir, corrupt)
+
+	// 历史查询不得把异常记录当作正常历史返回，也不得说档案不存在。
+	if _, found, err := s.History("A-2"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("History 应返回记录损坏: found=%v err=%v", found, err)
+	}
+	// 核对名单只含正常档案 A-1，也必须失败，不能给出可以办理或部分报告。
+	if _, err := s.Check(CheckRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("Check 应返回记录损坏: %v", err)
+	}
+	// 正式销毁不能生成清册或改变档案状态。
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("Destroy 应返回记录损坏: %v", err)
+	}
+	if got := readStateFile(t, dir); got != corrupt {
+		t.Fatalf("失败后原文件被改动:\n%q", got)
+	}
+
+	// 恢复后 A-1 未受影响，可以正常销毁。
+	writeStateFile(t, dir, original)
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); err != nil {
+		t.Fatalf("恢复后应能正常办理: %v", err)
+	}
+}
+
+// 合法的解除记录不受新校验影响：未解除冻结没有解除信息是合法状态且仍阻止销毁；
+// 解除日期与冻结日期相同合法，解除后不再作为冻结阻碍。
+func TestValidReleaseRecordsStillWork(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	if err := s.Freeze(FreezeInput{ArchiveID: "A-1", FreezeID: "F-1", Reason: "诉讼", FrozenOn: MustParseDate("2025-01-05")}); err != nil {
+		t.Fatal(err)
+	}
+	// 未解除：仍阻止销毁。
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrActiveFreeze) {
+		t.Fatalf("未解除冻结应阻止销毁: %v", err)
+	}
+	// 解除日期与冻结日期相同：合法。
+	if err := s.Release(ReleaseInput{ArchiveID: "A-1", FreezeID: "F-1", Reason: "结案", ReleasedOn: MustParseDate("2025-01-05")}); err != nil {
+		t.Fatalf("解除日期等于冻结日期应合法: %v", err)
+	}
+	h, found, err := s.History("A-1")
+	if err != nil || !found {
+		t.Fatalf("查询应成功: found=%v err=%v", found, err)
+	}
+	if len(h.Freezes) != 1 || !h.Freezes[0].Released ||
+		h.Freezes[0].ReleaseReason != "结案" ||
+		!h.Freezes[0].ReleasedOn.Equal(MustParseDate("2025-01-05")) {
+		t.Fatalf("历史中应保留完整解除信息: %+v", h.Freezes)
+	}
+	if len(h.ActiveFreezes) != 0 {
+		t.Fatalf("已解除冻结不应再列为未解除: %+v", h.ActiveFreezes)
+	}
+	// 解除后不再作为冻结阻碍，可以销毁。
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); err != nil {
+		t.Fatalf("解除后应能销毁: %v", err)
 	}
 }

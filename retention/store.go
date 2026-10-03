@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 )
@@ -32,7 +33,8 @@ type Store struct {
 // Open 打开（或创建）一个本地保存位置。
 // 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
-// 还拼接了其他内容等）时返回 ErrCorruptState，不会返回可继续办理的保管库，
+// 还拼接了其他内容，或已解除冻结的解除原因、解除日期缺失或解除日期早于
+// 冻结日期等）时返回 ErrCorruptState，不会返回可继续办理的保管库，
 // 已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
@@ -94,6 +96,10 @@ func (s *Store) rlock() (func(), error) {
 // 零字节或只有空白的文件、内容为 null 的文件、合法对象后面还拼接了
 // 第二个 JSON 值或无法解析的文字，都判为损坏并返回 ErrCorruptState，
 // 绝不只使用前一段内容，也不会改动原文件。
+//
+// 内容能解析时还要核对全部已解除冻结的解除信息：任一冻结标为已解除
+// 但解除原因为空白、解除日期缺失或早于冻结日期，整份保管库同样判为
+// 记录损坏（见 validateReleasedFreezes）。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -129,7 +135,47 @@ func (s *Store) load() (*storeData, error) {
 			ar.InitialEnd = ar.End
 		}
 	}
+	if err := validateReleasedFreezes(data); err != nil {
+		return nil, err
+	}
 	return data, nil
+}
+
+// validateReleasedFreezes 核对库内全部已解除冻结的解除信息是否完整有效。
+//
+// 解除功能在写入时要求填写解除日期与原因，且解除日期不得早于冻结日期；
+// 读取已保存记录时同样遵守这些要求：只要任一档案（包括已销毁档案）存在
+// 标为已解除但解除原因为空白、解除日期缺失或早于冻结日期的冻结，整份
+// 保管库即判为记录损坏，返回 ErrCorruptState。未解除的冻结没有解除日期
+// 和原因是合法状态，不在此列。
+func validateReleasedFreezes(data *storeData) error {
+	// 按档案编号排序遍历，保证同一份损坏内容报告的定位信息稳定。
+	ids := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		ar := data.Archives[id]
+		for _, fr := range ar.Freezes {
+			if !fr.Released {
+				continue
+			}
+			if normalizeText(fr.ReleaseReason) == "" {
+				return fmt.Errorf("retention: 档案 %s 的冻结 %s 已解除但解除原因缺失: %w",
+					ar.ID, fr.ID, ErrCorruptState)
+			}
+			if fr.ReleasedOn == nil || fr.ReleasedOn.IsZero() {
+				return fmt.Errorf("retention: 档案 %s 的冻结 %s 已解除但解除日期缺失: %w",
+					ar.ID, fr.ID, ErrCorruptState)
+			}
+			if fr.ReleasedOn.Before(fr.FrozenOn) {
+				return fmt.Errorf("retention: 档案 %s 的冻结 %s 解除日期 %s 早于冻结日期 %s: %w",
+					ar.ID, fr.ID, fr.ReleasedOn, fr.FrozenOn, ErrCorruptState)
+			}
+		}
+	}
+	return nil
 }
 
 // save 原子地写入状态：先写同目录临时文件并刷盘，再 rename 替换，最后刷目录。
