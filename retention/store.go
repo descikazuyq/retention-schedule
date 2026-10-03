@@ -36,7 +36,8 @@ type Store struct {
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
 // 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
-// 对应不上）时返回 ErrCorruptState，
+// 对应不上、修订编号在全库不唯一或与已关闭清册的申请编号相同）时返回
+// ErrCorruptState，
 // 不会返回可继续办理的保管库，已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
@@ -119,6 +120,14 @@ func (s *Store) rlock() (func(), error) {
 // 两个日期中任何一个都不能当作可靠依据，整份保管库判为损坏并返回
 // ErrCorruptState，错误信息指明涉及的档案编号，能对应到具体修订时
 // 同时指明修订编号。
+//
+// 每个成功的修订编号在全库也只能对应一条已保存的修订记录，且不得与
+// 已关闭清册的申请编号相同：同一档案的历史中重复出现同一编号、不同档案
+// 各自保存同号修订（无论内容是否相同），或修订编号等于某份清册的申请
+// 编号，按编号都无法唯一确定应取回哪条记录，整份保管库判为损坏并返回
+// ErrCorruptState，错误信息指明冲突编号与涉及的档案编号（跨档案重复时
+// 两份档案都给出，涉及清册时给出申请编号）。绝不合并重复记录或挑选
+// 其中一条继续使用。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -170,6 +179,11 @@ func (s *Store) load() (*storeData, error) {
 	// 最初截止日、修订记录与当前截止日必须连续衔接，否则当前期限与
 	// 历史期限相互矛盾，任何一个日期都不能当作核对依据。
 	if err := validateRevisionContinuity(data); err != nil {
+		return nil, err
+	}
+	// 每个成功的修订编号在全库只能对应一条已保存的修订记录，且不得
+	// 与已关闭清册的申请编号相同，否则按编号无法唯一确定应取回哪条记录。
+	if err := validateRevisionIDUniqueness(data); err != nil {
 		return nil, err
 	}
 	return data, nil
@@ -398,6 +412,69 @@ func validateRevisionContinuity(data *storeData) error {
 			return fmt.Errorf(
 				"retention: 档案 %s 的当前截止日 %s 与末次修订 %s 的新截止日 %s 不符，记录已损坏: %w",
 				id, ar.End, ar.Revisions[len(ar.Revisions)-1].ID, expected, ErrCorruptState)
+		}
+	}
+	return nil
+}
+
+// validateRevisionIDUniqueness 检查每个成功的修订编号在整个保管库内
+// 只对应一条已保存的修订记录，且不与任何已关闭清册的申请编号相同。
+//
+// 正常办理保存的记录必然满足：修订编号全库唯一，与销毁申请编号互不占用。
+// 同一档案的历史中重复出现同一编号、不同档案各自保存同号修订（无论两条
+// 记录内容是否相同），或修订编号与一份已关闭清册的申请编号相同，都说明
+// 按编号已无法唯一确定应取回哪条记录，保存内容已损坏，返回可由
+// ErrCorruptState 识别的错误。错误信息给出冲突编号与涉及的档案编号；
+// 跨档案重复时同时给出两份档案，涉及清册时给出申请编号。绝不合并重复
+// 记录或挑选其中一条继续使用。校验覆盖整个保管库的全部档案（含已销毁的）
+// 与全部清册，与本次办理名单无关。
+func validateRevisionIDUniqueness(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序后再检查，保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	// 修订编号 -> 首次保存该编号的档案编号。
+	owners := make(map[string]string)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			continue
+		}
+		for _, rec := range ar.Revisions {
+			if rec == nil {
+				// 空记录已由 validateRevisionContinuity 报告。
+				continue
+			}
+			first, dup := owners[rec.ID]
+			if !dup {
+				owners[rec.ID] = id
+				continue
+			}
+			if first == id {
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订历史中编号 %s 重复出现，记录已损坏: %w",
+					id, rec.ID, ErrCorruptState)
+			}
+			return fmt.Errorf(
+				"retention: 修订编号 %s 同时出现在档案 %s 与档案 %s 的历史中，记录已损坏: %w",
+				rec.ID, first, id, ErrCorruptState)
+		}
+	}
+
+	// 修订编号与已关闭清册的申请编号也必须互不占用。
+	applicationIDs := make([]string, 0, len(data.Manifests))
+	for id := range data.Manifests {
+		applicationIDs = append(applicationIDs, id)
+	}
+	sort.Strings(applicationIDs)
+	for _, appID := range applicationIDs {
+		if owner, ok := owners[appID]; ok {
+			return fmt.Errorf(
+				"retention: 档案 %s 的修订编号 %s 与已关闭清册的申请编号 %s 相同，记录已损坏: %w",
+				owner, appID, appID, ErrCorruptState)
 		}
 	}
 	return nil

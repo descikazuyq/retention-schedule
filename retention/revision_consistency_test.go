@@ -242,6 +242,283 @@ func TestRevisionCorruptionAfterOpenFailsAllOperations(t *testing.T) {
 	}
 }
 
+// 每个成功的修订编号在整个保管库内只能对应一条已保存的修订记录：
+// 同一档案历史中重复使用编号、不同档案各自保存同号修订（无论两条记录
+// 内容是否相同），以及修订编号与一份已关闭清册的申请编号相同，Open 都
+// 必须按记录损坏失败（ErrCorruptState），错误信息指出冲突编号与涉及的
+// 档案编号（跨档案重复时两份档案都要出现，涉及清册时要能识别是哪份申请），
+// 原文件保持原样，绝不合并记录或挑选其中一条继续使用。
+func TestOpenRejectsDuplicateRevisionIDs(t *testing.T) {
+	archive := func(id, initial, end, revisions string) string {
+		return `{"id":"` + id + `","category":"合同","start":"2020-01-01","end":"` + end +
+			`","initial_end":"` + initial + `","destroyed":false,"freezes":[]` + revisions + `}`
+	}
+	rev := func(id, oldEnd, newEnd string) string {
+		return `{"id":"` + id + `","old_end":"` + oldEnd + `","new_end":"` + newEnd +
+			`","revised_on":"2024-12-01","reason":"调整"}`
+	}
+	state := func(archives, manifests string) string {
+		return `{"version":1,"archives":{` + archives + `},"manifests":{` + manifests + `}}`
+	}
+
+	revA1 := `,"revisions":[` + rev("R-1", "2025-01-10", "2026-01-10") + `]`
+	corrupt := map[string]struct {
+		state   string
+		wantIDs []string
+	}{
+		"同一档案历史重复使用编号": {
+			state(`"A-1":`+archive("A-1", "2025-01-10", "2027-01-10",
+				`,"revisions":[`+rev("R-1", "2025-01-10", "2026-01-10")+`,`+
+					rev("R-1", "2026-01-10", "2027-01-10")+`]`), ""),
+			[]string{"R-1", "A-1"},
+		},
+		"不同档案保存同号修订且内容相同": {
+			state(`"A-1":`+archive("A-1", "2025-01-10", "2026-01-10", revA1)+`,`+
+				`"A-2":`+archive("A-2", "2025-01-10", "2026-01-10", revA1), ""),
+			[]string{"R-1", "A-1", "A-2"},
+		},
+		"不同档案保存同号修订且内容不同": {
+			state(`"A-1":`+archive("A-1", "2025-01-10", "2026-01-10", revA1)+`,`+
+				`"A-2":`+archive("A-2", "2025-01-10", "2027-01-10",
+					`,"revisions":[`+rev("R-1", "2025-01-10", "2027-01-10")+`]`), ""),
+			[]string{"R-1", "A-1", "A-2"},
+		},
+		"修订编号与已关闭清册的申请编号相同": {
+			state(
+				`"A-1":{"id":"A-1","category":"合同","start":"2020-01-01","end":"2025-01-10",`+
+					`"destroyed":true,"manifest_id":"APP-1","freezes":[]},`+
+					`"A-2":`+archive("A-2", "2025-01-10", "2026-01-10",
+						`,"revisions":[`+rev("APP-1", "2025-01-10", "2026-01-10")+`]`),
+				`"APP-1":{"application_id":"APP-1","processed_on":"2025-01-10",`+
+					`"entries":[{"id":"A-1","category":"合同","start":"2020-01-01","end":"2025-01-10"}]}`),
+			[]string{"APP-1", "A-2"},
+		},
+	}
+	for name, tc := range corrupt {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeStateFile(t, dir, tc.state)
+
+			s, err := Open(dir)
+			if err == nil {
+				s.Close()
+				t.Fatal("修订编号冲突时不应打开成功")
+			}
+			if !errors.Is(err, ErrCorruptState) {
+				t.Fatalf("错误应可判定为 ErrCorruptState，得到 %v", err)
+			}
+			for _, id := range tc.wantIDs {
+				if !strings.Contains(err.Error(), id) {
+					t.Fatalf("错误信息应指出 %s，得到 %v", id, err)
+				}
+			}
+			if got := readStateFile(t, dir); got != tc.state {
+				t.Fatalf("打开失败后原文件被改动: %q -> %q", tc.state, got)
+			}
+		})
+	}
+}
+
+// 保管库打开后保存内容才出现修订编号冲突：下一次查询、核对与办理都必须
+// 返回 ErrCorruptState——即使本次只操作没有重复编号的档案，或冲突记录
+// 所属档案已销毁；不给出部分历史、核对结论或清册，不改变期限、不冻结、
+// 不生成清册，原保存内容保持原样。
+func TestDuplicateRevisionIDAfterOpenFailsAllOperations(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "A-2", "凭证", "2020-01-01", "2025-01-10")
+	reg(t, s, "A-3", "合同", "2020-01-01", "2025-01-10")
+	revise(t, s, "R-1", "A-1", "2025-01-10", "2026-01-10", "2024-12-01", "延长")
+	revise(t, s, "R-2", "A-2", "2025-01-10", "2026-01-10", "2024-12-01", "延长")
+
+	// 把 A-2 的修订编号改成与 A-1 相同的 R-1：同一编号出现在两份档案的历史中。
+	rewriteState(t, dir, func(doc map[string]any) {
+		revisions := doc["archives"].(map[string]any)["A-2"].(map[string]any)["revisions"].([]any)
+		revisions[0].(map[string]any)["id"] = "R-1"
+	})
+	corruptContent := readStateFile(t, dir)
+
+	// 重新打开必须失败，错误指出冲突编号与两份档案。
+	s2, err := Open(dir)
+	if err == nil {
+		s2.Close()
+		t.Fatal("跨档案重复修订编号时，打开必须失败")
+	}
+	if !errors.Is(err, ErrCorruptState) ||
+		!strings.Contains(err.Error(), "R-1") ||
+		!strings.Contains(err.Error(), "A-1") || !strings.Contains(err.Error(), "A-2") {
+		t.Fatalf("打开错误应为 ErrCorruptState 并指出 R-1/A-1/A-2，得到 %v", err)
+	}
+
+	// 已打开的实例：查询冲突档案与没有重复编号的档案都必须失败。
+	if _, found, err := s.History("A-1"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("损坏后 History(A-1) 必须返回 ErrCorruptState: found=%v err=%v", found, err)
+	}
+	if _, found, err := s.History("A-3"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("查询无重复编号的 A-3 也应返回 ErrCorruptState: found=%v err=%v", found, err)
+	}
+	if _, found, err := s.GetManifest("APP-1"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("损坏后 GetManifest 必须返回 ErrCorruptState: found=%v err=%v", found, err)
+	}
+	if r, err := s.Check(CheckRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-3"},
+	}); !errors.Is(err, ErrCorruptState) || r.Status != "" || len(r.Results) != 0 {
+		t.Fatalf("损坏后 Check 必须失败且不得给出核对结论: %+v err=%v", r, err)
+	}
+	if m, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-3"},
+	}); !errors.Is(err, ErrCorruptState) || m.ApplicationID != "" {
+		t.Fatalf("损坏后 Destroy 必须失败且不得生成清册: %+v err=%v", m, err)
+	}
+	if _, err := s.Revise(ReviseInput{
+		RevisionID: "R-9", ArchiveID: "A-3",
+		OriginalEnd: MustParseDate("2025-01-10"), NewEnd: MustParseDate("2026-01-10"),
+		RevisedOn: MustParseDate("2025-01-07"), Reason: "延期",
+	}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Revise 必须失败: %v", err)
+	}
+	if err := s.Freeze(FreezeInput{
+		ArchiveID: "A-3", FreezeID: "F-1", Reason: "审计", FrozenOn: MustParseDate("2025-01-07"),
+	}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Freeze 必须失败: %v", err)
+	}
+	if err := s.Register(RegisterInput{
+		ID: "A-4", Category: "合同",
+		Start: MustParseDate("2020-01-01"), End: MustParseDate("2025-01-10"),
+	}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Register 必须失败: %v", err)
+	}
+
+	// 失败不得触发重新保存：损坏内容原样保留，不能自动改编号或删除历史。
+	if got := readStateFile(t, dir); got != corruptContent {
+		t.Fatalf("失败后原保存内容被改动:\n%q", got)
+	}
+}
+
+// 冲突记录所属档案已销毁时同样整库失败：销毁不释放修订编号，
+// 已销毁档案历史中的重复编号仍使整份保管库无法使用。
+func TestDuplicateRevisionIDOnDestroyedArchiveFailsWholeVault(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "D-1", "凭证", "2020-01-01", "2025-01-10")
+	revise(t, s, "R-1", "A-1", "2025-01-10", "2024-06-01", "2024-01-01", "缩短")
+	revise(t, s, "R-2", "D-1", "2025-01-10", "2024-06-01", "2024-01-01", "缩短")
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-D", ProcessedOn: MustParseDate("2024-06-01"), ArchiveIDs: []string{"D-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 已销毁档案 D-1 的修订编号被改成与 A-1 相同的 R-1。
+	rewriteState(t, dir, func(doc map[string]any) {
+		revisions := doc["archives"].(map[string]any)["D-1"].(map[string]any)["revisions"].([]any)
+		revisions[0].(map[string]any)["id"] = "R-1"
+	})
+	corruptContent := readStateFile(t, dir)
+
+	s2, err := Open(dir)
+	if err == nil {
+		s2.Close()
+		t.Fatal("已销毁档案的修订编号重复时，打开必须失败")
+	}
+	if !errors.Is(err, ErrCorruptState) ||
+		!strings.Contains(err.Error(), "R-1") ||
+		!strings.Contains(err.Error(), "A-1") || !strings.Contains(err.Error(), "D-1") {
+		t.Fatalf("打开错误应为 ErrCorruptState 并指出 R-1/A-1/D-1，得到 %v", err)
+	}
+
+	if _, found, err := s.History("A-1"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("查询正常档案 A-1 也应返回 ErrCorruptState: found=%v err=%v", found, err)
+	}
+	if _, found, err := s.GetManifest("APP-D"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("查询已关闭清册也应失败: found=%v err=%v", found, err)
+	}
+	if r, err := s.Check(CheckRequest{
+		ApplicationID: "APP-9", ProcessedOn: MustParseDate("2024-06-01"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) || r.Status != "" {
+		t.Fatalf("核对正常档案也应整次失败: %+v err=%v", r, err)
+	}
+	if m, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-9", ProcessedOn: MustParseDate("2024-06-01"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) || m.ApplicationID != "" {
+		t.Fatalf("不得在损坏状态下生成清册: %+v err=%v", m, err)
+	}
+	if got := readStateFile(t, dir); got != corruptContent {
+		t.Fatalf("失败后原保存内容被改动:\n%q", got)
+	}
+}
+
+// 合法记录不受编号唯一性校验影响：同编号同内容的重试仍取回首次记录，
+// 即使期限后来再变或档案已销毁，也不会被误判成保存记录重复；
+// 首次提交时复用成功业务占用的编号仍按编号冲突（ErrRevisionConflict）处理。
+func TestUniqueRevisionIDsKeepWorking(t *testing.T) {
+	s := openTestStore(t)
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "A-2", "合同", "2020-01-01", "2025-01-10")
+
+	in := ReviseInput{
+		RevisionID:  "R-1",
+		ArchiveID:   "A-1",
+		OriginalEnd: MustParseDate("2025-01-10"),
+		NewEnd:      MustParseDate("2026-01-10"),
+		RevisedOn:   MustParseDate("2024-12-01"),
+		Reason:      "延长",
+	}
+	first, err := s.Revise(in)
+	if err != nil {
+		t.Fatalf("首次修订失败: %v", err)
+	}
+	// 另一份档案各自保存不同编号的修订，互不影响。
+	revise(t, s, "R-2", "A-2", "2025-01-10", "2026-01-10", "2024-12-01", "延长")
+
+	// 期限后来再变，同编号同内容重试仍取回首次记录，不增加历史。
+	revise(t, s, "R-3", "A-1", "2026-01-10", "2027-01-10", "2025-01-01", "再延长")
+	again, err := s.Revise(in)
+	if err != nil || again != first {
+		t.Fatalf("期限再变后重试仍应取回原记录: %+v err=%v", again, err)
+	}
+
+	// 档案已销毁，重试仍取回原记录。
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-1", ProcessedOn: MustParseDate("2027-01-10"), ArchiveIDs: []string{"A-1"},
+	}); err != nil {
+		t.Fatalf("销毁失败: %v", err)
+	}
+	again, err = s.Revise(in)
+	if err != nil || again != first {
+		t.Fatalf("销毁后重试仍应取回原记录: %+v err=%v", again, err)
+	}
+	h, _, _ := s.History("A-1")
+	if len(h.Revisions) != 2 {
+		t.Fatalf("重试不应增加历史，应有 2 条，得到 %d", len(h.Revisions))
+	}
+
+	// 首次提交复用成功修订占用的编号（内容不同）仍是编号冲突，不是记录损坏。
+	conflict := in
+	conflict.ArchiveID = "A-2"
+	if _, err := s.Revise(conflict); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("复用成功编号应返回编号冲突，得到 %v", err)
+	}
+	// 首次提交复用已关闭清册的申请编号仍是编号冲突，不是记录损坏。
+	if _, err := s.Revise(ReviseInput{
+		RevisionID:  "APP-1", ArchiveID: "A-2",
+		OriginalEnd: MustParseDate("2026-01-10"), NewEnd: MustParseDate("2027-01-10"),
+		RevisedOn: MustParseDate("2025-01-02"), Reason: "占用申请编号",
+	}); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("复用申请编号应返回编号冲突，得到 %v", err)
+	}
+}
+
 // 修订关系矛盾出现在另一份档案（含已销毁档案）身上时，打开与后续办理
 // 同样整库失败，不因本次只操作正常档案而放过异常记录。
 func TestBrokenRevisionChainOnOtherArchiveFailsWholeVault(t *testing.T) {
