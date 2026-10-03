@@ -35,7 +35,8 @@ type Store struct {
 // 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
-// 缺少解除原因或解除日期、解除日期早于冻结日期）时返回 ErrCorruptState，
+// 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
+// 对应不上）时返回 ErrCorruptState，
 // 不会返回可继续办理的保管库，已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
@@ -102,6 +103,13 @@ func (s *Store) rlock() (func(), error) {
 // 解除原因和有效的解除日期，且解除日期不早于冻结日期——与解除功能
 // 办理时的要求一致。缺少任一信息或日期顺序不成立时，整份保管库同样
 // 判为损坏并返回 ErrCorruptState，错误信息指明涉及的档案与冻结编号。
+//
+// 已销毁档案与已关闭清册也必须相互对应：每份已销毁档案记下的申请编号
+// 必须能找到一份清册，且该清册恰好收录该档案一次；清册收录的每份档案
+// 也必须存在、标成已销毁并指回这份清册。已销毁档案找不到清册、同一档案
+// 出现在多份清册、归属指向别的申请，或未销毁档案仍挂有清册申请编号，
+// 都说明记录已无法说明档案由哪次申请销毁，整份保管库判为损坏并返回
+// ErrCorruptState，错误信息指明涉及的档案编号与相关申请编号。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -135,6 +143,11 @@ func (s *Store) load() (*storeData, error) {
 	// 只有“已解除”标记而缺少任一信息，或解除日期早于冻结日期的记录
 	// 一律判为损坏（即使所属档案已销毁）；绝不据此继续办理或修补记录。
 	if err := validateFreezeReleaseRecords(data); err != nil {
+		return nil, err
+	}
+	// 已销毁档案与已关闭清册必须相互对应，否则无法说明档案由哪次申请销毁。
+	// 关系损坏时绝不挑选其中一份记录继续使用，也不补清册或改销毁标记。
+	if err := validateManifestConsistency(data); err != nil {
 		return nil, err
 	}
 	// 兼容引入修订功能之前保存的保管库：没有记录最初截止日时，
@@ -195,6 +208,112 @@ func validateFreezeReleaseRecords(data *storeData) error {
 				return fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 的解除日期 %s 早于冻结日期 %s，记录已损坏: %w",
 					id, fr.ID, fr.ReleasedOn, fr.FrozenOn, ErrCorruptState)
+			}
+		}
+	}
+	return nil
+}
+
+// validateManifestConsistency 检查已销毁档案与已关闭清册之间的对应关系。
+//
+// 正常销毁保存的记录必然满足双向对应：每份已销毁档案记下的申请编号
+// 能找到一份清册，且该清册恰好收录该档案一次；清册收录的每份档案都
+// 存在、标成已销毁，并指回这份清册。已销毁档案没有清册归属、归属的
+// 清册不存在或未收录该档案、同一档案出现在多份清册、清册重复收录同一
+// 档案、清册收录了不存在或未销毁的档案、档案归属指向别的申请，以及
+// 未销毁档案仍挂有清册申请编号，都说明保存内容已损坏，返回可由
+// ErrCorruptState 识别的错误，并在信息中给出涉及的档案编号与相关
+// 申请编号，便于定位记录。校验覆盖整个保管库，与本次办理名单无关；
+// 未销毁且没有清册归属的档案是合法记录，不在此报错。
+func validateManifestConsistency(data *storeData) error {
+	// map 遍历顺序不稳定，按编号排序后再检查，保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			continue
+		}
+		if !ar.Destroyed {
+			if ar.ManifestID != "" {
+				return fmt.Errorf(
+					"retention: 档案 %s 未销毁却挂有清册申请编号 %s，记录已损坏: %w",
+					id, ar.ManifestID, ErrCorruptState)
+			}
+			continue
+		}
+		if ar.ManifestID == "" {
+			return fmt.Errorf(
+				"retention: 档案 %s 已销毁但没有记录所属清册的申请编号，记录已损坏: %w",
+				id, ErrCorruptState)
+		}
+		rec, ok := data.Manifests[ar.ManifestID]
+		if !ok || rec == nil {
+			return fmt.Errorf(
+				"retention: 档案 %s 已销毁，但其所属清册 %s 不存在，记录已损坏: %w",
+				id, ar.ManifestID, ErrCorruptState)
+		}
+		count := 0
+		for _, e := range rec.Entries {
+			if e.ID == id {
+				count++
+			}
+		}
+		if count != 1 {
+			return fmt.Errorf(
+				"retention: 档案 %s 在其所属清册 %s 中收录 %d 次（应恰好一次），记录已损坏: %w",
+				id, ar.ManifestID, count, ErrCorruptState)
+		}
+	}
+
+	applicationIDs := make([]string, 0, len(data.Manifests))
+	for id := range data.Manifests {
+		applicationIDs = append(applicationIDs, id)
+	}
+	sort.Strings(applicationIDs)
+	for _, appID := range applicationIDs {
+		rec := data.Manifests[appID]
+		if rec == nil {
+			return fmt.Errorf(
+				"retention: 清册 %s 的内容缺失，记录已损坏: %w",
+				appID, ErrCorruptState)
+		}
+		seen := make(map[string]int, len(rec.Entries))
+		for _, e := range rec.Entries {
+			seen[e.ID]++
+			ar, ok := data.Archives[e.ID]
+			if !ok || ar == nil {
+				return fmt.Errorf(
+					"retention: 清册 %s 收录的档案 %s 不存在，记录已损坏: %w",
+					appID, e.ID, ErrCorruptState)
+			}
+			if !ar.Destroyed {
+				return fmt.Errorf(
+					"retention: 清册 %s 收录的档案 %s 未标记为已销毁，记录已损坏: %w",
+					appID, e.ID, ErrCorruptState)
+			}
+			if ar.ManifestID != appID {
+				return fmt.Errorf(
+					"retention: 清册 %s 收录的档案 %s 归属另一申请 %s，记录已损坏: %w",
+					appID, e.ID, ar.ManifestID, ErrCorruptState)
+			}
+		}
+		// 同一档案被同一份清册重复收录（档案侧的恰好一次检查只覆盖
+		// 归属指向该清册的情况，这里对全部收录记录再核对一遍）。
+		entryIDs := make([]string, 0, len(seen))
+		for id := range seen {
+			entryIDs = append(entryIDs, id)
+		}
+		sort.Strings(entryIDs)
+		for _, id := range entryIDs {
+			if seen[id] > 1 {
+				return fmt.Errorf(
+					"retention: 清册 %s 重复收录档案 %s（共 %d 次），记录已损坏: %w",
+					appID, id, seen[id], ErrCorruptState)
 			}
 		}
 	}
