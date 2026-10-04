@@ -396,6 +396,218 @@ func TestIncompleteReleaseAfterOpenFailsAllOperations(t *testing.T) {
 	}
 }
 
+// 仍被冻结的档案不能销毁，销毁后的历史同样遵守这条规则：
+// 已销毁档案仍带有一条标记为未解除的冻结时，即使清册归属、条目内容与
+// 处理日期都合法，打开也必须按整库记录损坏失败，错误指出档案编号、
+// 未解除的冻结编号与所属清册申请编号，原文件保持原样。
+func TestOpenRejectsDestroyedArchiveWithActiveFreeze(t *testing.T) {
+	// setup 登记并销毁一份曾冻结后解除的档案，返回保存位置；
+	// 调用方随后把冻结改回未解除，模拟保存内容出现的矛盾。
+	setup := func(t *testing.T) string {
+		dir := t.TempDir()
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+		if err := s.Freeze(FreezeInput{ArchiveID: "A-1", FreezeID: "F-1", Reason: "诉讼", FrozenOn: MustParseDate("2025-01-05")}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Release(ReleaseInput{ArchiveID: "A-1", FreezeID: "F-1", Reason: "结案", ReleasedOn: MustParseDate("2025-01-06")}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Destroy(DestructionRequest{
+			ApplicationID: "APP-1", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	freezes := func(doc map[string]any) []any {
+		return doc["archives"].(map[string]any)["A-1"].(map[string]any)["freezes"].([]any)
+	}
+
+	t.Run("未解除且无解除信息", func(t *testing.T) {
+		dir := setup(t)
+		rewriteState(t, dir, func(doc map[string]any) {
+			f := freezes(doc)[0].(map[string]any)
+			f["released"] = false
+			delete(f, "release_reason")
+			delete(f, "released_on")
+		})
+		content := readStateFile(t, dir)
+
+		s, err := Open(dir)
+		if err == nil {
+			s.Close()
+			t.Fatal("已销毁档案仍带未解除冻结时不应打开成功")
+		}
+		if !errors.Is(err, ErrCorruptState) {
+			t.Fatalf("错误应可判定为 ErrCorruptState，得到 %v", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"A-1", "F-1", "APP-1"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("错误信息应指出 %s，得到 %v", want, err)
+			}
+		}
+		if got := readStateFile(t, dir); got != content {
+			t.Fatalf("打开失败后原文件被改动:\n%q", got)
+		}
+	})
+
+	t.Run("残留解除日期与原因仍按未解除判断", func(t *testing.T) {
+		dir := setup(t)
+		// 只把解除标记改回 false，解除日期与原因原样残留：
+		// 是否解除只按标记判断，残留信息不能当作已解除。
+		rewriteState(t, dir, func(doc map[string]any) {
+			freezes(doc)[0].(map[string]any)["released"] = false
+		})
+
+		s, err := Open(dir)
+		if err == nil {
+			s.Close()
+			t.Fatal("仍标记为未解除时，残留的解除日期与原因不能使记录合法")
+		}
+		if !errors.Is(err, ErrCorruptState) ||
+			!strings.Contains(err.Error(), "A-1") ||
+			!strings.Contains(err.Error(), "F-1") ||
+			!strings.Contains(err.Error(), "APP-1") {
+			t.Fatalf("错误应为 ErrCorruptState 并指出 A-1/F-1/APP-1，得到 %v", err)
+		}
+	})
+
+	t.Run("其他冻结已解除不能抵消", func(t *testing.T) {
+		dir := setup(t)
+		// 追加一条已合法解除的冻结 F-2，再把 F-1 改回未解除：
+		// F-2 已解除不能抵消 F-1 这条阻碍。
+		rewriteState(t, dir, func(doc map[string]any) {
+			fs := freezes(doc)
+			fs = append(fs, map[string]any{
+				"id": "F-2", "reason": "审计", "frozen_on": "2025-01-07",
+				"released": true, "release_reason": "审计结束", "released_on": "2025-01-08",
+			})
+			doc["archives"].(map[string]any)["A-1"].(map[string]any)["freezes"] = fs
+			fs[0].(map[string]any)["released"] = false
+		})
+
+		s, err := Open(dir)
+		if err == nil {
+			s.Close()
+			t.Fatal("任一未解除冻结都应使整库判为损坏")
+		}
+		if !errors.Is(err, ErrCorruptState) || !strings.Contains(err.Error(), "F-1") {
+			t.Fatalf("错误应为 ErrCorruptState 并指出未解除的 F-1，得到 %v", err)
+		}
+	})
+
+	// 对照组：已销毁档案的全部冻结均已合法解除时是正常记录，
+	// 重新打开后历史与清册继续完整可查。
+	t.Run("全部冻结已解除的已销毁档案可正常打开", func(t *testing.T) {
+		dir := setup(t)
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatalf("全部冻结已解除的已销毁档案应能打开: %v", err)
+		}
+		defer s.Close()
+		h, found, err := s.History("A-1")
+		if err != nil || !found || !h.Destroyed {
+			t.Fatalf("已销毁档案的历史应可查: found=%v err=%v", found, err)
+		}
+		if len(h.Freezes) != 1 || !h.Freezes[0].Released || len(h.ActiveFreezes) != 0 {
+			t.Fatalf("冻结历史应完整保留且全部已解除: %+v", h.Freezes)
+		}
+		if _, found, err := s.GetManifest("APP-1"); err != nil || !found {
+			t.Fatalf("所属清册应可取回: found=%v err=%v", found, err)
+		}
+	})
+}
+
+// 保管库已经打开后，保存内容才出现“已销毁档案仍带未解除冻结”的矛盾：
+// 下一次使用有效输入的查询、核对与办理都必须按整库记录损坏失败，
+// 与本次选中的档案无关，且失败后原保存内容保持原样。
+func TestActiveFreezeOnDestroyedArchiveAfterOpenFailsWholeVault(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reg(t, s, "A-1", "合同", "2020-01-01", "2025-01-10")
+	reg(t, s, "D-1", "凭证", "2020-01-01", "2025-01-10")
+	reg(t, s, "D-2", "凭证", "2020-01-01", "2025-01-10")
+	if err := s.Freeze(FreezeInput{ArchiveID: "D-1", FreezeID: "F-D", Reason: "协查", FrozenOn: MustParseDate("2025-01-05")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release(ReleaseInput{ArchiveID: "D-1", FreezeID: "F-D", Reason: "协查结束", ReleasedOn: MustParseDate("2025-01-06")}); err != nil {
+		t.Fatal(err)
+	}
+	// D-1 与 D-2 同属一份清册；矛盾只出现在 D-1 身上。
+	if _, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-D", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"D-1", "D-2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := s.History("A-1"); err != nil || !found {
+		t.Fatalf("损坏前查询应成功: found=%v err=%v", found, err)
+	}
+
+	// 把 D-1 的冻结改回未解除：销毁记录与冻结状态互相矛盾。
+	rewriteState(t, dir, func(doc map[string]any) {
+		freezes := doc["archives"].(map[string]any)["D-1"].(map[string]any)["freezes"].([]any)
+		freezes[0].(map[string]any)["released"] = false
+	})
+	corruptContent := readStateFile(t, dir)
+
+	// 重新打开整个位置必须失败，错误指出 D-1、F-D 与所属清册 APP-D。
+	s2, err := Open(dir)
+	if err == nil {
+		s2.Close()
+		t.Fatal("已销毁档案仍带未解除冻结时，打开必须失败")
+	}
+	if !errors.Is(err, ErrCorruptState) ||
+		!strings.Contains(err.Error(), "D-1") ||
+		!strings.Contains(err.Error(), "F-D") ||
+		!strings.Contains(err.Error(), "APP-D") {
+		t.Fatalf("打开错误应为 ErrCorruptState 并指出 D-1/F-D/APP-D，得到 %v", err)
+	}
+
+	// 已打开的实例：即使只操作与矛盾无关的 A-1，或同清册中正常的 D-2，
+	// 查询、核对与办理也都必须按整库损坏失败，不得给出正常结论或部分报告。
+	if _, found, err := s.History("A-1"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("查询无关档案 A-1 也应返回 ErrCorruptState: found=%v err=%v", found, err)
+	}
+	if _, found, err := s.History("D-2"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("查询同清册的正常档案 D-2 也应失败: found=%v err=%v", found, err)
+	}
+	if _, found, err := s.GetManifest("APP-D"); !errors.Is(err, ErrCorruptState) || found {
+		t.Fatalf("取回清册也应失败: found=%v err=%v", found, err)
+	}
+	if r, err := s.Check(CheckRequest{
+		ApplicationID: "APP-9", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) || r.Status != "" || len(r.Results) != 0 {
+		t.Fatalf("核对必须整次失败且不得给出部分报告: %+v err=%v", r, err)
+	}
+	if m, err := s.Destroy(DestructionRequest{
+		ApplicationID: "APP-9", ProcessedOn: MustParseDate("2025-01-10"), ArchiveIDs: []string{"A-1"},
+	}); !errors.Is(err, ErrCorruptState) || m.ApplicationID != "" {
+		t.Fatalf("不得在损坏状态下生成清册: %+v err=%v", m, err)
+	}
+	if err := s.Register(RegisterInput{ID: "A-2", Category: "凭证", Start: MustParseDate("2020-01-01"), End: MustParseDate("2025-01-10")}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Register 必须失败: %v", err)
+	}
+	if err := s.Release(ReleaseInput{ArchiveID: "D-1", FreezeID: "F-D", Reason: "结案", ReleasedOn: MustParseDate("2025-01-07")}); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("损坏后 Release 必须失败，不能借办理消除冲突: %v", err)
+	}
+
+	// 失败不得触发任何修复：不自动解除冻结、不删冻结历史、不改销毁标记、
+	// 不重建清册，损坏内容原样保留。
+	if got := readStateFile(t, dir); got != corruptContent {
+		t.Fatalf("失败后原保存内容被改动:\n%q", got)
+	}
+}
+
 // 损坏判断适用于库内全部已解除冻结，与本次办理名单无关：
 // 异常记录挂在另一份已经销毁的档案下时，查询、核对、销毁其他档案
 // 同样必须按记录损坏失败，不能把不完整解除信息作为正常历史返回。
