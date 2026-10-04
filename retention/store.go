@@ -34,8 +34,8 @@ type Store struct {
 // Open 打开（或创建）一个本地保存位置。
 // 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
-// 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
-// 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
+// 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如任一档案缺少
+// 起算日或当前生效的保管截止日、截止日早于起算日、已解除冻结缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
 // 对应不上、已销毁档案仍带未解除冻结、已关闭清册缺少处理日期、清册处理
 // 日期早于所收录档案销毁时最终生效的保管截止日（提前销毁）、已关闭清册
 // 条目保存的类别、起算日或截止日（须为销毁时最终生效的期限）与档案登记
@@ -107,6 +107,14 @@ func (s *Store) rlock() (func(), error) {
 // 解除原因和有效的解除日期，且解除日期不早于冻结日期——与解除功能
 // 办理时的要求一致。缺少任一信息或日期顺序不成立时，整份保管库同样
 // 判为损坏并返回 ErrCorruptState，错误信息指明涉及的档案与冻结编号。
+//
+// 每份档案的起算日与当前生效的保管截止日也都必须存在，且截止日不得
+// 早于起算日——与登记、修订办理时的要求一致。任一档案缺少其中一个
+// 日期，或两个日期的先后关系不合法，整份保管库判为损坏并返回
+// ErrCorruptState，错误信息指明档案编号与缺失的日期项，顺序错误时
+// 同时给出两项日期。已修订、已销毁的档案同样遵守这条当前期限规则；
+// 没有修订记录的旧档案可以缺少最初截止日与修订列表（按登记截止日
+// 兼容补齐最初截止日），但起算日与当前截止日不能靠兼容补齐。
 //
 // 已销毁档案与已关闭清册也必须相互对应：每份已销毁档案记下的申请编号
 // 必须能找到一份清册，且该清册恰好收录该档案一次；清册收录的每份档案
@@ -197,6 +205,11 @@ func (s *Store) load() (*storeData, error) {
 	// 只有“已解除”标记而缺少任一信息，或解除日期早于冻结日期的记录
 	// 一律判为损坏（即使所属档案已销毁）；绝不据此继续办理或修补记录。
 	if err := validateFreezeReleaseRecords(data); err != nil {
+		return nil, err
+	}
+	// 每份档案的起算日与当前生效的截止日都必须存在且顺序合法，
+	// 否则销毁前核对会把缺截止日的档案当成已经到期。
+	if err := validateArchiveRetentionDates(data); err != nil {
 		return nil, err
 	}
 	// 已销毁档案与已关闭清册必须相互对应，否则无法说明档案由哪次申请销毁。
@@ -291,6 +304,61 @@ func validateFreezeReleaseRecords(data *storeData) error {
 					"retention: 档案 %s 的冻结 %s 的解除日期 %s 早于冻结日期 %s，记录已损坏: %w",
 					id, fr.ID, fr.ReleasedOn, fr.FrozenOn, ErrCorruptState)
 			}
+		}
+	}
+	return nil
+}
+
+// validateArchiveRetentionDates 检查库内每份档案的起算日与当前生效的保管截止日
+// 是否齐备且顺序合法。
+//
+// 登记与修订在办理时都要求起算日、截止日齐备且截止日不早于起算日，保存下来
+// 的记录也必须满足同一条规则：任一档案缺少起算日或当前截止日（字段缺失、
+// 为 null 或解析后为零值），或两个日期齐备但截止日早于起算日，都说明保存
+// 内容已损坏，返回可由 ErrCorruptState 识别的错误。缺少日期时错误信息指出
+// 档案编号并说明缺的是起算日还是截止日（两者都缺则一并指出）；顺序错误时
+// 同时给出起算日与截止日两项日期，便于定位记录。
+//
+// 没有这条校验，缺少当前截止日的档案在销毁前核对中会被当成已经到期
+// （任何处理日期都不早于零值截止日），正式提交也可能据此生成清册——
+// 一份无法确认保管期限的档案绝不能获得可以销毁的结论。
+//
+// 校验覆盖整个保管库的全部档案，与本次办理名单或查询目标无关：已修订的档案
+// 按当前生效的截止日检查（修订历史衔接完整不能替代当前期限的存在），已销毁
+// 的档案同样检查（已有清册不能略过这条规则）；没有修订记录的旧档案可以缺少
+// 最初截止日与修订列表（由 load 中的兼容处理按登记截止日补齐最初截止日），
+// 但起算日与当前截止日本身不能靠兼容补齐。截止日等于起算日是合法记录，
+// 按截止日当天核对即到期，不在此报错。
+func validateArchiveRetentionDates(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序后再检查，保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			continue
+		}
+		switch {
+		case ar.Start.IsZero() && ar.End.IsZero():
+			return fmt.Errorf(
+				"retention: 档案 %s 缺少起算日与当前保管截止日，记录已损坏: %w",
+				id, ErrCorruptState)
+		case ar.Start.IsZero():
+			return fmt.Errorf(
+				"retention: 档案 %s 缺少起算日，记录已损坏: %w",
+				id, ErrCorruptState)
+		case ar.End.IsZero():
+			return fmt.Errorf(
+				"retention: 档案 %s 缺少当前保管截止日，记录已损坏: %w",
+				id, ErrCorruptState)
+		case ar.End.Before(ar.Start):
+			return fmt.Errorf(
+				"retention: 档案 %s 的当前保管截止日 %s 早于起算日 %s，记录已损坏: %w",
+				id, ar.End, ar.Start, ErrCorruptState)
 		}
 	}
 	return nil
