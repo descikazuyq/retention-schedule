@@ -37,7 +37,8 @@ type Store struct {
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
 // 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
 // 对应不上、已关闭清册条目保存的类别、起算日或截止日（须为销毁时最终
-// 生效的期限）与档案登记内容不一致、修订记录衔接不上、成功修订编号在保存
+// 生效的期限）与档案登记内容不一致、已关闭清册缺少处理日期或处理日期早于
+// 所收录档案在清册中保存的截止日、修订记录衔接不上、成功修订编号在保存
 // 历史中不唯一或与已关闭清册的申请编号相同）时返回 ErrCorruptState，
 // 不会返回可继续办理的保管库，已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
@@ -125,6 +126,17 @@ func (s *Store) rlock() (func(), error) {
 // 档案或删除记录消除差异。一份清册收录多份档案时，一份条目矛盾就使
 // 整份保管库无法读取，不会返回其余条目的正常结果。
 //
+// 已关闭清册还必须满足办理销毁时的到期规则：处理日期必须存在，且不早于
+// 所收录任何一份档案在清册中保存的保管截止日（截止日当天即到期）——
+// 与办理销毁时共用的到期判断一致，期限有过修订时按销毁时最终生效并保存
+// 到清册里的截止日判断，不按修订记录的办理日期重新选择另一版期限。清册
+// 缺少处理日期（不能把缺失当成已经办理的销毁日期），或处理日期早于任一
+// 收录档案的截止日，都说明这份清册不可能由合法办理产生，整份保管库判为
+// 损坏并返回 ErrCorruptState，绝不只返回已到期的条目或略过未到期的条目。
+// 错误信息指明清册申请编号；处理日期提前时同时指明档案编号、处理日期与
+// 截止日。校验覆盖整个保管库的全部清册与全部条目，与本次办理名单或查询
+// 目标无关：一份清册收录多份档案时，任一档案未到期就使整库不可读。
+//
 // 最初截止日、修订记录与当前截止日也必须连续对应：第一条修订的原截止日
 // 等于最初截止日，后续每条的原截止日等于上一条的新截止日，最后一条的
 // 新截止日等于当前截止日；没有修订时最初截止日与当前截止日相同。修订
@@ -194,6 +206,11 @@ func (s *Store) load() (*storeData, error) {
 	// 其类别、起算日与截止日必须与对应档案保存的登记内容逐项一致，
 	// 截止日必须是该档案销毁时最终生效的期限，不能拿最初登记的截止日顶替。
 	if err := validateManifestSnapshots(data); err != nil {
+		return nil, err
+	}
+	// 已关闭清册还必须遵守办理销毁时的到期规则：处理日期必须存在，
+	// 且不早于所收录任何一份档案在清册中保存的截止日（截止日当天即到期）。
+	if err := validateManifestProcessedOn(data); err != nil {
 		return nil, err
 	}
 	// 最初截止日、修订记录与当前截止日必须连续衔接，否则当前期限与
@@ -419,6 +436,51 @@ func validateManifestSnapshots(data *storeData) error {
 				return fmt.Errorf(
 					"retention: 清册 %s 中档案 %s 的条目与档案登记内容不一致：%s，记录已损坏: %w",
 					appID, e.ID, strings.Join(items, "、"), ErrCorruptState)
+			}
+		}
+	}
+	return nil
+}
+
+// validateManifestProcessedOn 检查每份已关闭清册的处理日期是否满足办理销毁时
+// 的到期规则。
+//
+// 正常销毁保存的清册必然带有处理日期，且处理日期不早于所收录任何一份档案
+// 当时最终生效的保管截止日（截止日当天即到期）——与 Destroy 办理时共用的
+// evaluateArchive 判断一致。清册缺少处理日期（不能把缺失当成已经办理的销毁
+// 日期），或处理日期早于某条收录档案在清册中保存的截止日，都说明这份清册
+// 不可能由合法办理产生，保存内容已损坏，返回可由 ErrCorruptState 识别的错误；
+// 绝不只返回已到期的条目，也不略过未到期的条目。
+//
+// 到期判断以清册条目保存的截止日为准：该日期是销毁时最终生效并保存到清册里
+// 的期限（期限被延长、缩短或改回早先用过的日期都一样），不按修订记录的办理
+// 日期重新选择另一版期限。错误信息给出清册申请编号；处理日期缺失时指出申请
+// 编号，提前销毁时同时指出申请编号、档案编号、处理日期与截止日。校验覆盖
+// 整个保管库的全部清册与全部条目，与本次办理名单或查询目标无关：一份清册
+// 收录多份档案时，任一档案未到期就使整份保管库判为损坏。
+func validateManifestProcessedOn(data *storeData) error {
+	// map 遍历顺序不稳定，按申请编号排序后再检查，保证错误信息稳定。
+	appIDs := make([]string, 0, len(data.Manifests))
+	for appID := range data.Manifests {
+		appIDs = append(appIDs, appID)
+	}
+	sort.Strings(appIDs)
+	for _, appID := range appIDs {
+		rec := data.Manifests[appID]
+		if rec == nil {
+			// 缺失的清册记录已由 validateManifestConsistency 报告。
+			continue
+		}
+		if rec.ProcessedOn.IsZero() {
+			return fmt.Errorf(
+				"retention: 清册 %s 缺少处理日期，记录已损坏: %w",
+				appID, ErrCorruptState)
+		}
+		for _, e := range rec.Entries {
+			if rec.ProcessedOn.Before(e.End) {
+				return fmt.Errorf(
+					"retention: 清册 %s 的处理日期 %s 早于所收录档案 %s 的保管截止日 %s，记录已损坏: %w",
+					appID, rec.ProcessedOn, e.ID, e.End, ErrCorruptState)
 			}
 		}
 	}
