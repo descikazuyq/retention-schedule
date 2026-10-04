@@ -177,9 +177,12 @@ type freezeRecord struct {
 }
 
 type manifestRecord struct {
-	ApplicationID string          `json:"application_id"`
-	ProcessedOn   Date            `json:"processed_on"`
-	Entries       []manifestEntry `json:"entries"`
+	ApplicationID string `json:"application_id"`
+	// ProcessedOn 用指针保存：清册缺少处理日期或保存为 null 时保持 nil，
+	// 由 load 的语义校验按损坏报告（并能指出申请编号），而不是落入 JSON 解析错误。
+	// 通过校验的已关闭清册必然带有有效处理日期。
+	ProcessedOn *Date           `json:"processed_on"`
+	Entries     []manifestEntry `json:"entries"`
 }
 
 type manifestEntry struct {

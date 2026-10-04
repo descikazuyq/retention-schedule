@@ -391,9 +391,10 @@ func (s *Store) Destroy(req DestructionRequest) (Manifest, error) {
 		}
 
 		// 全部满足：生成关闭清册，内容为各档案当时登记内容的快照。
+		processedOn := req.ProcessedOn
 		rec := &manifestRecord{
 			ApplicationID: applicationID,
-			ProcessedOn:   req.ProcessedOn,
+			ProcessedOn:   &processedOn,
 		}
 		ordered := append([]string(nil), ids...)
 		sort.Strings(ordered)
@@ -419,8 +420,9 @@ func (s *Store) Destroy(req DestructionRequest) (Manifest, error) {
 }
 
 // sameApplication 判断已成功申请与本次提交的处理日期和档案集合是否完全一致（顺序无关）。
+// 调用前记录已通过 load 的语义校验，处理日期必然存在且有效。
 func sameApplication(existing *manifestRecord, processedOn Date, idSet map[string]struct{}) bool {
-	if !existing.ProcessedOn.Equal(processedOn) {
+	if existing.ProcessedOn == nil || !existing.ProcessedOn.Equal(processedOn) {
 		return false
 	}
 	if len(existing.Entries) != len(idSet) {
@@ -437,8 +439,11 @@ func sameApplication(existing *manifestRecord, processedOn Date, idSet map[strin
 func manifestFromRecord(rec *manifestRecord) Manifest {
 	m := Manifest{
 		ApplicationID: rec.ApplicationID,
-		ProcessedOn:   rec.ProcessedOn,
 		Entries:       make([]ManifestEntry, 0, len(rec.Entries)),
+	}
+	// 通过校验的已关闭清册必然带有有效处理日期；防御性保留零值兜底。
+	if rec.ProcessedOn != nil {
+		m.ProcessedOn = *rec.ProcessedOn
 	}
 	for _, e := range rec.Entries {
 		m.Entries = append(m.Entries, ManifestEntry{

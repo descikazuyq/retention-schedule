@@ -69,7 +69,10 @@ func evaluateArchive(data *storeData, id string, processedOn Date) ArchiveCheckR
 		obs := CheckObstruction{Kind: ObstructionDestroyed}
 		if rec, ok := data.Manifests[ar.ManifestID]; ok {
 			obs.ManifestApplicationID = rec.ApplicationID
-			obs.ProcessedOn = rec.ProcessedOn
+			// 通过校验的已关闭清册必然带有有效处理日期。
+			if rec.ProcessedOn != nil {
+				obs.ProcessedOn = *rec.ProcessedOn
+			}
 		} else {
 			obs.ManifestApplicationID = ar.ManifestID
 		}
