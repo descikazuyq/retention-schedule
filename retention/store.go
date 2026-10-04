@@ -36,12 +36,12 @@ type Store struct {
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如已解除冻结
 // 缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
-// 对应不上、已关闭清册缺少处理日期、清册处理日期早于所收录档案销毁时最终
-// 生效的保管截止日（提前销毁）、已关闭清册条目保存的类别、起算日或截止日
-// （须为销毁时最终生效的期限）与档案登记内容不一致、修订记录衔接不上、
-// 成功修订编号在保存历史中不唯一或与已关闭清册的申请编号相同）时返回
-// ErrCorruptState，不会返回可继续办理的保管库，已有记录保持原样，不会被
-// 清空、修补或覆盖。
+// 对应不上、已销毁档案仍带未解除冻结、已关闭清册缺少处理日期、清册处理
+// 日期早于所收录档案销毁时最终生效的保管截止日（提前销毁）、已关闭清册
+// 条目保存的类别、起算日或截止日（须为销毁时最终生效的期限）与档案登记
+// 内容不一致、修订记录衔接不上、成功修订编号在保存历史中不唯一或与已关闭
+// 清册的申请编号相同）时返回 ErrCorruptState，不会返回可继续办理的保管库，
+// 已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("retention: 保存位置不能为空")
@@ -114,6 +114,14 @@ func (s *Store) rlock() (func(), error) {
 // 出现在多份清册、归属指向别的申请，或未销毁档案仍挂有清册申请编号，
 // 都说明记录已无法说明档案由哪次申请销毁，整份保管库判为损坏并返回
 // ErrCorruptState，错误信息指明涉及的档案编号与相关申请编号。
+//
+// 归属对应之外，冻结状态也必须与销毁记录一致：仍被冻结的档案不能销毁，
+// 已销毁档案的全部冻结都应已合法解除；只要任一已销毁档案还有一条冻结仍
+// 标记为未解除，即使清册归属、条目内容和处理日期都合法，销毁记录与冻结
+// 状态也互相矛盾，整份保管库判为损坏并返回 ErrCorruptState，错误信息指明
+// 档案编号、未解除的冻结编号与所属清册申请编号。同一档案其他冻结已解除
+// 不能抵消这一条；残留的解除日期或解除原因也不能把仍标记为未解除的冻结
+// 当作已解除——是否解除只看保存的解除标记。
 //
 // 仅归属对应还不够：已关闭清册中的每条档案条目是销毁成功那一刻登记内容
 // 的快照，其类别、起算日、截止日必须与对应档案当前保存的登记内容逐项
@@ -194,6 +202,12 @@ func (s *Store) load() (*storeData, error) {
 	// 已销毁档案与已关闭清册必须相互对应，否则无法说明档案由哪次申请销毁。
 	// 关系损坏时绝不挑选其中一份记录继续使用，也不补清册或改销毁标记。
 	if err := validateManifestConsistency(data); err != nil {
+		return nil, err
+	}
+	// 已销毁档案不能仍带未解除冻结：冻结挡住销毁是办理时的硬性规则，
+	// 销毁后的历史也必须满足。归属、条目与处理日期即使都合法，这项矛盾
+	// 仍使整库记录不可信。
+	if err := validateDestroyedArchiveFreezes(data); err != nil {
 		return nil, err
 	}
 	// 兼容引入修订功能之前保存的保管库：没有修订记录也没有最初截止日时，
@@ -382,6 +396,57 @@ func validateManifestConsistency(data *storeData) error {
 				return fmt.Errorf(
 					"retention: 清册 %s 重复收录档案 %s（共 %d 次），记录已损坏: %w",
 					appID, id, seen[id], ErrCorruptState)
+			}
+		}
+	}
+	return nil
+}
+
+// validateDestroyedArchiveFreezes 检查已销毁档案是否仍带着未解除的冻结。
+//
+// 办理销毁时，任一未解除冻结都会阻止销毁（见 evaluateArchive），因此保存
+// 下来的历史也必须满足同一条规则：每份已销毁档案的全部冻结都应已合法解除。
+// 档案已标记为已销毁、所属清册存在且清册归属、条目快照与处理日期都合法，
+// 但该档案仍有一条冻结标记为未解除（released 为 false）时，销毁记录与冻结
+// 状态互相矛盾，两份记录无法同时成立，整份保管库判为损坏并返回
+// ErrCorruptState，错误信息给出档案编号、未解除的冻结编号与所属清册的申请
+// 编号，让调用者知道是哪份销毁记录与冻结状态冲突。
+//
+// 同一档案有多条冻结时，其他冻结已经解除不能抵消这一条阻碍，逐份档案只要
+// 命中第一条未解除冻结即报错；即使这条记录里残留了解除日期或解除原因，只要
+// 仍标记为未解除，就不能据此当作已解除——是否解除只沿用保存的解除标记判断，
+// 解除日期与原因的合法性仍由 validateFreezeReleaseRecords 单独核对。
+// 校验覆盖整个保管库的全部已销毁档案，与本次办理名单或查询目标无关：
+// 一份清册收录多份档案，只有其中一份矛盾，或调用者只操作另一份正常档案时，
+// 整份保管库同样判为损坏，绝不返回其余档案的正常结果。绝不通过自动解除冻结、
+// 删除冻结历史、修改销毁标记或重建清册来消除冲突。
+// 尚未销毁的档案保留未解除冻结是合法状态，不在此报错。
+func validateDestroyedArchiveFreezes(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序、冻结按登记顺序检查，
+	// 保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil || !ar.Destroyed {
+			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告；
+			// 尚未销毁的档案保留未解除冻结是合法状态。
+			continue
+		}
+		for _, fr := range ar.Freezes {
+			if fr == nil {
+				// 空冻结记录已由 validateFreezeReleaseRecords 报告。
+				continue
+			}
+			if !fr.Released {
+				// 归属关系已由 validateManifestConsistency 确认：
+				// 已销毁档案必然带有存在的所属清册申请编号。
+				return fmt.Errorf(
+					"retention: 档案 %s 已销毁（所属清册 %s），但冻结 %s 仍标记为未解除，冻结状态与销毁记录冲突，记录已损坏: %w",
+					id, ar.ManifestID, fr.ID, ErrCorruptState)
 			}
 		}
 	}
