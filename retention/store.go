@@ -43,7 +43,7 @@ type Store struct {
 // 日期早于所收录档案销毁时最终生效的保管截止日（提前销毁）、已关闭清册
 // 条目保存的类别、起算日或截止日（须为销毁时最终生效的期限）与档案登记
 // 内容不一致、修订记录衔接不上、修订历史中存在早于起算日的截止日、成功修订编号在保存历史中不唯一或与已关闭
-// 清册的申请编号相同）时返回 ErrCorruptState，不会返回可继续办理的保管库，
+// 清册的申请编号相同、同一申请编号在保存的清册集合中对应多份清册）时返回 ErrCorruptState，不会返回可继续办理的保管库，
 // 已有记录保持原样，不会被清空、修补或覆盖。
 func Open(dir string) (*Store, error) {
 	if dir == "" {
@@ -122,6 +122,21 @@ func (s *Store) rlock() (func(), error) {
 // 字符串解码后的实际文本识别：直接写出的 A-1 与通过 Unicode 转义写出的
 // 同一编号仍算重复；不同编号各自登记一次不受影响，不同档案登记内容里
 // 出现相同字段名是正常格式，不会被误判为编号重复。
+//
+// 清册集合中的申请编号同样必须唯一：一个已成功的销毁申请编号只能对应一份
+// 已关闭清册。清册集合也以 JSON 对象保存，普通解码遇到同编号键会静默保留
+// 最后一个值，让后一份清册覆盖前一份；两份清册可能各自都符合档案归属、
+// 条目快照、期限与处理日期规则，仅留下后一份时保管库仍能打开，取回的清册
+// 却随保存顺序改变。因此解码时逐键核对：同一申请编号对应两份清册即判为
+// 损坏并返回 ErrCorruptState，错误信息给出重复的申请编号并说明该编号对应
+// 多份清册，绝不以后一份替代前一份，也不按处理日期或收录档案挑选其中一份。
+// 两份清册完全相同也不是合并或忽略重复的理由；两份收录相同档案但处理日期
+// 不同（即使两个日期都满足到期规则）同样拒绝，拒绝结果与两份记录的保存
+// 顺序无关。这种重复保存不是正常的申请重试——幂等重放应取回唯一的原清册，
+// 绝不产生两份记录。编号按 JSON 字符串解码后的实际文本识别：直接写出的
+// APP-1 与通过 Unicode 转义写出的同一编号仍算重复；不同申请编号各自对应
+// 一份清册不受影响，不同清册记录内部带有处理日期、条目、档案编号等同名
+// 字段是正常格式，不会被误判为申请编号重复。
 //
 // 每份档案的起算日与当前生效的保管截止日也都必须存在，且截止日不得
 // 早于起算日——与登记、修订办理时的要求一致。任一档案缺少其中一个
@@ -227,14 +242,22 @@ func (s *Store) load() (*storeData, error) {
 	// json.Unmarshal 要求整个输入恰好是一个 JSON 值：
 	// 合法对象后面再拼接任何内容都会在这里报错。
 	if err := json.Unmarshal(raw, data); err != nil {
-		// 档案集合中同一编号登记多次属于记录损坏而非单纯的语法错误：
-		// 错误信息给出重复的档案编号并说明登记重复，绝不以后一份登记
-		// 覆盖前一份后继续使用。
-		var dupID *duplicateArchiveIDError
-		if errors.As(err, &dupID) {
+		// 集合中同一键出现多次属于记录损坏而非单纯的语法错误，绝不以后一份
+		// 记录覆盖前一份后继续使用。
+		var dupArchiveID *duplicateArchiveIDError
+		if errors.As(err, &dupArchiveID) {
+			// 错误信息给出重复的档案编号并说明登记重复。
 			return nil, fmt.Errorf(
 				"retention: 档案编号 %s 在保存的档案集合中重复登记，同一编号只能对应一份登记记录，记录已损坏: %w",
-				dupID.ID, ErrCorruptState)
+				dupArchiveID.ID, ErrCorruptState)
+		}
+		var dupAppID *duplicateApplicationIDError
+		if errors.As(err, &dupAppID) {
+			// 错误信息给出重复的申请编号并说明该编号对应多份清册：
+			// 已成功的销毁申请只能对应一份已关闭清册，重复保存不是申请重试。
+			return nil, fmt.Errorf(
+				"retention: 申请编号 %s 在保存的清册集合中对应多份清册，一个已成功的销毁申请只能对应一份已关闭清册，记录已损坏: %w",
+				dupAppID.ID, ErrCorruptState)
 		}
 		return nil, fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
 	}
@@ -242,7 +265,7 @@ func (s *Store) load() (*storeData, error) {
 		data.Archives = archiveMap{}
 	}
 	if data.Manifests == nil {
-		data.Manifests = map[string]*manifestRecord{}
+		data.Manifests = manifestMap{}
 	}
 	// 冻结编号唯一性必须先于其他语义校验：同一档案的全部冻结历史中，
 	// 一个冻结编号只能出现一次，解除过的记录仍占用原编号。重复时后续校验
