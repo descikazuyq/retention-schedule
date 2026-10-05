@@ -1,5 +1,11 @@
 package retention
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 // 以下类型是对外的只读视图，由查询方法复制内部状态生成，
 // 调用方修改它们不会影响保管库中保存的记录。
 
@@ -192,16 +198,87 @@ type manifestEntry struct {
 	End      Date   `json:"end"`
 }
 
+// archiveMap 以档案编号为键保存登记记录，并在从 JSON 解码时守住
+// “一个档案编号只能登记一次”的要求。
+//
+// 直接把对象解码进普通 map 时，encoding/json 对同名键只会保留最后一个
+// 值：保存内容中若写了两份同编号登记，前一份会被静默覆盖（例如前一份带着
+// 未解除的诉讼冻结、后一份冻结列表为空，读取后只剩后一份，销毁资格会被
+// 误判）。UnmarshalJSON 逐键解码并按解码后的实际文本核对编号，出现重复时
+// 返回 duplicateArchiveIDError，由 load 统一包装成 ErrCorruptState。
+type archiveMap map[string]*archiveRecord
+
+// UnmarshalJSON 逐键解码档案集合，发现重复编号即报错。
+//
+// 编号按 JSON 字符串解码后的实际文本识别：直接写出的 "A-1" 与通过 Unicode
+// 转义写出的同一编号（键写作 "A-" 紧接 1 的 Unicode 转义形式）仍算重复；不同档案登记内容里出现相同
+// 的字段名（如各自的 "id"）属于正常格式，与此无关——那些是登记记录内部的
+// 字段，不是档案集合对象的键。键的解码经过与值内文本一致的 JSON 转义处理，
+// 因此不会因保存文字看起来不同而放行重复编号。
+func (m *archiveMap) UnmarshalJSON(raw []byte) error {
+	// archives 保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		*m = archiveMap{}
+		return nil
+	}
+	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成记录，
+	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: archives 字段不是 JSON 对象")
+	}
+
+	out := archiveMap{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		id, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: archives 字段的档案编号不是 JSON 字符串")
+		}
+		var rec archiveRecord
+		if err := dec.Decode(&rec); err != nil {
+			return err
+		}
+		if _, dup := out[id]; dup {
+			return &duplicateArchiveIDError{ID: id}
+		}
+		out[id] = &rec
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	*m = out
+	return nil
+}
+
+// duplicateArchiveIDError 表示保存的档案集合中同一编号出现了多次。
+// 它在包内由 load 统一包装成可由 ErrCorruptState 识别的错误。
+type duplicateArchiveIDError struct {
+	ID string
+}
+
+func (e *duplicateArchiveIDError) Error() string {
+	return "retention: 档案编号 " + e.ID + " 在保存的档案集合中登记了多次"
+}
+
 type storeData struct {
 	Version   int                        `json:"version"`
-	Archives  map[string]*archiveRecord  `json:"archives"`
+	Archives  archiveMap                 `json:"archives"`
 	Manifests map[string]*manifestRecord `json:"manifests"`
 }
 
 func newStoreData() *storeData {
 	return &storeData{
 		Version:   1,
-		Archives:  map[string]*archiveRecord{},
+		Archives:  archiveMap{},
 		Manifests: map[string]*manifestRecord{},
 	}
 }
