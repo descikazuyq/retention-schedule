@@ -34,7 +34,8 @@ type Store struct {
 // Open 打开（或创建）一个本地保存位置。
 // 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
-// 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如任一档案缺少
+// 还拼接了其他内容、保存的档案集合中同一档案编号直接登记了两次等），
+// 或其中保存的记录不满足业务不变量（例如任一档案缺少
 // 起算日或当前生效的保管截止日、当前截止日或最初截止日、任一修订的原截止日、
 // 新截止日早于起算日、同一档案的冻结历史中
 // 冻结编号重复（解除过的记录仍占用原编号）、已解除冻结缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
@@ -117,6 +118,18 @@ func (s *Store) rlock() (func(), error) {
 // 同时给出两项日期。已修订、已销毁的档案同样遵守这条当前期限规则；
 // 没有修订记录的旧档案可以缺少最初截止日与修订列表（按登记截止日
 // 兼容补齐最初截止日），但起算日与当前截止日不能靠兼容补齐。
+//
+// 档案编号在保存的档案集合中也必须唯一：archives 是以编号为键的 JSON
+// 对象，json.Unmarshal 遇到重复键时会静默用后一份登记覆盖前一份，若同一
+// 集合保存了两份同编号登记（前一份带未解除冻结、后一份冻结列表为空等），
+// 折叠后只剩后一份，前一份的冻结与修订历史就此丢失，销毁资格可能被错误
+// 放过。因此必须直接遍历 JSON 令牌在 archives 对象这一层识别重复键：只要
+// 一个编号直接出现两次，无论两份登记内容完全相同还是不同，都不能合并、
+// 忽略，也不能按期限长短或冻结状态挑选可信记录，整份保管库判为损坏并
+// 返回 ErrCorruptState，错误信息给出重复的档案编号并说明登记重复，原保存
+// 内容保持原样。编号按 JSON 字符串解码后的实际文本识别，直接写出与
+// Unicode 转义写出的同一编号仍算重复；只检查档案集合的直接键，不递归进入
+// 各份登记内容，不同档案里重复出现的 id、freezes 等同名字段属正常格式。
 //
 // 冻结编号与冻结历史也必须一一对应：每份档案的全部冻结记录（含已经
 // 解除的——解除只做标记，记录全部保留，原编号继续被占用）中，一个冻结
@@ -222,6 +235,14 @@ func (s *Store) load() (*storeData, error) {
 	if data.Manifests == nil {
 		data.Manifests = map[string]*manifestRecord{}
 	}
+	// 档案编号唯一是登记时就守住的要求，读取保存内容时也必须守住：
+	// archives 是按编号索引的对象，JSON 对象重复键会被 json.Unmarshal
+	// 静默折叠成一份（只留下后一个值），前一份登记的冻结、修订等信息会
+	// 就此丢失，必须在令牌层识别重复键并按整库损坏拒绝。该校验独立于
+	// 折叠后的 data 之外，必须先于其他语义校验执行。
+	if err := validateArchiveRegistrationKeys(raw); err != nil {
+		return nil, err
+	}
 	// 冻结编号唯一性必须先于其他语义校验：同一档案的全部冻结历史中，
 	// 一个冻结编号只能出现一次，解除过的记录仍占用原编号。重复时后续校验
 	// 会不知道同号记录对应哪次冻结，必须先按整库损坏拒绝。
@@ -288,6 +309,129 @@ func (s *Store) load() (*storeData, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// validateArchiveRegistrationKeys 检查保存内容中的档案编号是否唯一。
+//
+// archives 是一个以档案编号为键的 JSON 对象。正常办理保存的记录中每个编号
+// 只登记一次；但 json.Unmarshal 遇到同一对象内重复的键时不会报错，而是静默
+// 用后一个值覆盖前一个——若同一集合中保存了两份同编号登记（先保存一份带未
+// 解除冻结、随后又保存一份冻结列表为空等），折叠后只会留下后一份，前一份
+// 的冻结、修订历史就此丢失，核对可能据此给出可以办理，正式销毁也可能成功。
+// 因此不能依赖折叠后的 map，必须直接遍历 JSON 令牌，在 archives 对象这一层
+// 逐个记录出现过的键。
+//
+// 只要同一保存的档案集合对象中一个编号直接出现两次，无论两份登记的类别、
+// 日期、冻结与修订历史完全相同还是内容不同，都不能作为合并、忽略或挑选可信
+// 记录的理由（不按哪份期限更长、哪份仍被冻结挑选），整份保管库判为损坏并
+// 返回 ErrCorruptState，错误信息给出重复的档案编号并说明登记重复；绝不返回
+// 可继续使用的保管库，原保存内容保持原样。
+//
+// 编号按 JSON 字符串解码后的实际文本比较：直接写出的 "A-1" 与通过 Unicode
+// 转义（如 "A-1"）写出的同一编号仍算重复；只有编码后文本不同才算不同
+// 编号。仅检查 archives 对象的直接键，不递归进入各份登记的内容——不同档案
+// 的登记中出现相同字段名（id、category、freezes 等）属于正常保存格式，绝不
+// 能误判成档案编号重复。
+//
+// 输入在此前已成功完成 json.Unmarshal，结构必然是合法的单个 JSON 值，令牌
+// 读取失败属于不应发生的情况，同样按损坏处理。
+func validateArchiveRegistrationKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// 定位顶层对象与其 "archives" 属性值。
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return fmt.Errorf("retention: 无法定位保存内容中的档案集合，状态文件已损坏: %w", ErrCorruptState)
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: 状态文件内容无法解析，属性名不是字符串: %w", ErrCorruptState)
+		}
+		if key != "archives" {
+			// 跳过非 archives 的顶层属性值，嵌套对象由 Decoder 整体跳过。
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+			continue
+		}
+		openTok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+		}
+		// "archives": null 与缺失该字段同样按空集合处理（json.Unmarshal 会把
+		// null 保留为 nil map，load 已兼容为空集合）；只有对象类型才可能含登记。
+		if openTok == nil {
+			continue
+		}
+		if openTok != json.Delim('{') {
+			return fmt.Errorf("retention: 保存内容中的档案集合不是对象，状态文件已损坏: %w", ErrCorruptState)
+		}
+		seen := make(map[string]struct{})
+		for dec.More() {
+			// 键令牌是解码后的字符串：JSON 转义（含 Unicode 转义）已还原，
+			// 直接写出与转义写出的同一编号得到同一文本。
+			idTok, err := dec.Token()
+			if err != nil {
+				return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+			}
+			id, ok := idTok.(string)
+			if !ok {
+				return fmt.Errorf("retention: 档案集合的编号不是字符串，状态文件已损坏: %w", ErrCorruptState)
+			}
+			// 登记内容整体跳过：其中的 id、freezes 等同名字段与档案编号无关。
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+			if _, dup := seen[id]; dup {
+				return fmt.Errorf(
+					"retention: 档案编号 %s 在保存的档案集合中登记重复，同一编号只能有一份登记，不能用后一份替代前一份，记录已损坏: %w",
+					id, ErrCorruptState)
+			}
+			seen[id] = struct{}{}
+		}
+		if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+			return fmt.Errorf("retention: 档案集合内容无法完整读取，状态文件已损坏: %w", ErrCorruptState)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+	}
+	return nil
+}
+
+// skipJSONValue 消费并丢弃解码器当前位置上的一整个 JSON 值
+// （对象、数组或标量），使下一个 Token 落在该值之后。
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{', '[':
+		for dec.More() {
+			if delim == '{' {
+				// 跳过对象成员的键，再跳过其值。
+				if _, err := dec.Token(); err != nil {
+					return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+				}
+			}
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil {
+			return fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
+		}
+	}
+	return nil
 }
 
 // validateFreezeIDs 检查每份档案的全部冻结历史中冻结编号是否唯一。
