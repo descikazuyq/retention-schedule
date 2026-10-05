@@ -204,8 +204,14 @@ type manifestEntry struct {
 // 直接把对象解码进普通 map 时，encoding/json 对同名键只会保留最后一个
 // 值：保存内容中若写了两份同编号登记，前一份会被静默覆盖（例如前一份带着
 // 未解除的诉讼冻结、后一份冻结列表为空，读取后只剩后一份，销毁资格会被
-// 误判）。UnmarshalJSON 逐键解码并按解码后的实际文本核对编号，出现重复时
-// 返回 duplicateArchiveIDError，由 load 统一包装成 ErrCorruptState。
+// 误判）。除键不重复外，每条记录的身份还必须自洽：用于找到该记录的键与
+// 记录内容里的 id 必须同为非空白文本且逐字相同。键与 id 是两处独立保存的
+// 文本，普通解码不会核对它们，可能出现挂在 A-1 名下、id 却写成 A-2，或
+// id 缺失、为 null、空串、只有空白的记录——按 A-1 查到的历史会标着 A-2，
+// 销毁还可能把 A-2 写进清册。这层检查不在 UnmarshalJSON 中完成（解码只
+// 负责拒绝重复键），而由 load 的 validateArchiveIdentity 在进入任何业务
+// 操作前统一核对，命中即包装成 ErrCorruptState：绝不做去空白、大小写
+// 归一化、改号或补写缺失编号。
 type archiveMap map[string]*archiveRecord
 
 // UnmarshalJSON 逐键解码档案集合，发现重复编号即报错。
