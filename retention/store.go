@@ -35,7 +35,8 @@ type Store struct {
 // 目录不存在时会创建；状态文件不存在时按空库打开，可以正常登记。
 // 状态文件已存在但内容损坏（空文件、只有空白、内容为 null、合法对象后面
 // 还拼接了其他内容等），或其中保存的记录不满足业务不变量（例如任一档案缺少
-// 起算日或当前生效的保管截止日、截止日早于起算日、同一档案的冻结历史中
+// 起算日或当前生效的保管截止日、截止日早于起算日——包括最初截止日与修订
+// 历史中的原截止日、新截止日早于起算日、同一档案的冻结历史中
 // 冻结编号重复（解除过的记录仍占用原编号）、已解除冻结缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
 // 对应不上、已销毁档案仍带未解除冻结、已关闭清册缺少处理日期、清册处理
 // 日期早于所收录档案销毁时最终生效的保管截止日（提前销毁）、已关闭清册
@@ -174,6 +175,14 @@ func (s *Store) rlock() (func(), error) {
 // ErrCorruptState，错误信息指明涉及的档案编号，能对应到具体修订时
 // 同时指明修订编号。
 //
+// 历史中的期限日期也必须遵守办理时同一条规则：最初截止日与每条修订的
+// 原截止日、新截止日都不得早于同一档案的起算日。当前截止日合法、修订
+// 前后衔接完整，都不能掩盖历史中途出现过的非法期限——即使最后改回了
+// 合法日期，这样的记录也不可能由正常办理产生，整份保管库判为损坏并返回
+// ErrCorruptState，错误信息指明档案编号、出错的期限位置、该截止日与
+// 起算日，问题发生在修订记录中时同时指明修订编号；尚未销毁与已销毁的
+// 档案同样适用。截止日等于起算日是合法记录。
+//
 // 每个成功修订编号在整个保管库内只能对应一条保存的修订记录，且不能与
 // 已关闭清册的申请编号相同——与办理时“修订编号全库唯一、与销毁申请编号
 // 互不占用”的要求一致。同一档案历史中重复出现同一编号、不同档案各自保存
@@ -261,6 +270,12 @@ func (s *Store) load() (*storeData, error) {
 	// 最初截止日、修订记录与当前截止日必须连续衔接，否则当前期限与
 	// 历史期限相互矛盾，任何一个日期都不能当作核对依据。
 	if err := validateRevisionContinuity(data); err != nil {
+		return nil, err
+	}
+	// 历史中的每个期限日期也必须遵守办理时的同一条规则：最初截止日与
+	// 每条修订的原截止日、新截止日都不得早于起算日。衔接完整、当前期限
+	// 合法不能掩盖中途出现过的非法期限。
+	if err := validateHistoricalRetentionDates(data); err != nil {
 		return nil, err
 	}
 	// 成功修订编号在整个保管库内只能对应一条保存的修订记录，且不能与
@@ -772,6 +787,64 @@ func validateRevisionContinuity(data *storeData) error {
 	return nil
 }
 
+// validateHistoricalRetentionDates 检查每份档案历史中的全部期限日期是否遵守
+// 办理时同一条规则：截止日不得早于起算日。
+//
+// 登记与修订在办理时都要求截止日不早于起算日，因此保存下来的历史期限也必须
+// 满足同一条规则：最初截止日，以及每条修订记录中的原截止日、新截止日，都不
+// 得早于同一档案的起算日。当前生效的截止日合法、修订前后衔接完整，都不能
+// 掩盖历史中途出现过的非法期限——那样的记录不可能由正常办理产生，即使最后
+// 改回了合法日期，整份保管库仍判为损坏并返回 ErrCorruptState。错误信息指明
+// 档案编号、出错的期限位置（最初截止日，或修订的原截止日、新截止日）、该
+// 截止日与起算日；问题发生在修订记录中时同时指明修订编号。
+//
+// 校验覆盖整个保管库的全部档案（含已销毁的——已关闭清册的归属、条目与处理
+// 日期都正确也不能掩盖历史中的非法期限），与本次办理名单或查询目标无关。
+// 截止日等于起算日是合法记录，不在此报错；没有修订记录的旧档案缺少最初
+// 截止日时，load 已按登记截止日兼容补齐，补齐值必然不早于起算日。
+// 本校验在 validateRevisionContinuity 之后运行，衔接关系已确认完整，
+// 修订记录中的空记录与缺失的最初截止日也已先行报告。
+func validateHistoricalRetentionDates(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序、修订按保存顺序检查，
+	// 保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			continue
+		}
+		if !ar.InitialEnd.IsZero() && ar.InitialEnd.Before(ar.Start) {
+			return fmt.Errorf(
+				"retention: 档案 %s 的最初保管截止日 %s 早于起算日 %s，记录已损坏: %w",
+				id, ar.InitialEnd, ar.Start, ErrCorruptState)
+		}
+		for _, rec := range ar.Revisions {
+			if rec == nil {
+				// 空记录已由 validateRevisionContinuity 报告。
+				continue
+			}
+			if rec.OldEnd.Before(ar.Start) {
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订 %s 的原截止日 %s 早于起算日 %s，记录已损坏: %w",
+					id, rec.ID, rec.OldEnd, ar.Start, ErrCorruptState)
+			}
+			if rec.NewEnd.Before(ar.Start) {
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订 %s 的新截止日 %s 早于起算日 %s，记录已损坏: %w",
+					id, rec.ID, rec.NewEnd, ar.Start, ErrCorruptState)
+			}
+		}
+	}
+	return nil
+}
+
+
+//
 // validateRevisionIDs 检查成功修订编号在整个保管库内的唯一性，以及与已关闭
 // 清册申请编号的互不占用。
 //
