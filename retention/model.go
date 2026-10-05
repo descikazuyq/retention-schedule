@@ -269,16 +269,89 @@ func (e *duplicateArchiveIDError) Error() string {
 	return "retention: 档案编号 " + e.ID + " 在保存的档案集合中登记了多次"
 }
 
+// manifestMap 以申请编号为键保存已关闭清册，并在从 JSON 解码时守住
+// “一个成功的销毁申请只能对应一份已关闭清册”的要求。
+//
+// 直接把对象解码进普通 map 时，encoding/json 对同名键只会保留最后一个
+// 值：保存内容中若写了两份同一申请编号的清册，前一份会被静默覆盖（例如
+// 同一 APP-1 下分别保存了档案截止日当天处理与次日处理的两份清册，读取后
+// 只剩后一份；两份都满足归属、期限与到期规则时，取回的清册会随保存顺序
+// 改变）。UnmarshalJSON 逐键解码并按解码后的实际文本核对编号，出现重复时
+// 返回 duplicateManifestIDError，由 load 统一包装成 ErrCorruptState。
+type manifestMap map[string]*manifestRecord
+
+// UnmarshalJSON 逐键解码清册集合，发现重复申请编号即报错。
+//
+// 编号按 JSON 字符串解码后的实际文本识别：直接写出的 "APP-1" 与通过
+// Unicode 转义写出的同一编号仍算重复；不同清册内容里出现相同的字段名
+// （如各自的 "application_id"、"processed_on"、"entries" 以及条目内的
+// "id"）属于正常格式，与此无关——那些是清册记录内部的字段，不是清册
+// 集合对象的键。键的解码经过与值内文本一致的 JSON 转义处理，因此不会
+// 因保存文字看起来不同而放行重复编号。
+func (m *manifestMap) UnmarshalJSON(raw []byte) error {
+	// manifests 保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		*m = manifestMap{}
+		return nil
+	}
+	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成清册，
+	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: manifests 字段不是 JSON 对象")
+	}
+
+	out := manifestMap{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		id, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: manifests 字段的申请编号不是 JSON 字符串")
+		}
+		var rec manifestRecord
+		if err := dec.Decode(&rec); err != nil {
+			return err
+		}
+		if _, dup := out[id]; dup {
+			return &duplicateManifestIDError{ID: id}
+		}
+		out[id] = &rec
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	*m = out
+	return nil
+}
+
+// duplicateManifestIDError 表示保存的清册集合中同一申请编号出现了多次。
+// 它在包内由 load 统一包装成可由 ErrCorruptState 识别的错误。
+type duplicateManifestIDError struct {
+	ID string
+}
+
+func (e *duplicateManifestIDError) Error() string {
+	return "retention: 申请编号 " + e.ID + " 在保存的清册集合中对应了多份清册"
+}
+
 type storeData struct {
-	Version   int                        `json:"version"`
-	Archives  archiveMap                 `json:"archives"`
-	Manifests map[string]*manifestRecord `json:"manifests"`
+	Version   int         `json:"version"`
+	Archives  archiveMap  `json:"archives"`
+	Manifests manifestMap `json:"manifests"`
 }
 
 func newStoreData() *storeData {
 	return &storeData{
 		Version:   1,
 		Archives:  archiveMap{},
-		Manifests: map[string]*manifestRecord{},
+		Manifests: manifestMap{},
 	}
 }
