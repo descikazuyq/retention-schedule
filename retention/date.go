@@ -1,6 +1,7 @@
 package retention
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 )
@@ -16,26 +17,42 @@ type Date struct {
 
 // ParseDate 按 YYYY-MM-DD 解析日期。
 // 只接受完整的四位年份、两位月份、两位日期，且日期必须真实存在。
+// 每一位都必须是 0-9 的数字：带正负号、缺少补零、首尾空白、
+// 附带时间或含反斜杠转义的文本一律拒绝，不做去空白、补位或去符号。
 func ParseDate(s string) (Date, error) {
 	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
 		return Date{}, &InvalidDateError{Value: s}
 	}
-	year, err := strconv.Atoi(s[0:4])
-	if err != nil {
+	year, ok := parseFixedDigits(s[0:4])
+	if !ok {
 		return Date{}, &InvalidDateError{Value: s}
 	}
-	month, err := strconv.Atoi(s[5:7])
-	if err != nil {
+	month, ok := parseFixedDigits(s[5:7])
+	if !ok {
 		return Date{}, &InvalidDateError{Value: s}
 	}
-	day, err := strconv.Atoi(s[8:10])
-	if err != nil {
+	day, ok := parseFixedDigits(s[8:10])
+	if !ok {
 		return Date{}, &InvalidDateError{Value: s}
 	}
 	if !validCalendarDate(year, month, day) {
 		return Date{}, &InvalidDateError{Value: s}
 	}
 	return Date{year, month, day}, nil
+}
+
+// parseFixedDigits 把一段必须全部由 0-9 数字组成的文本转成整数。
+// 任何非数字字符（含正负号、空白、反斜杠）都报告失败。
+func parseFixedDigits(s string) (int, bool) {
+	value := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		value = value*10 + int(c-'0')
+	}
+	return value, true
 }
 
 // MustParseDate 按 YYYY-MM-DD 解析日期，失败即 panic。
@@ -88,11 +105,18 @@ func (d Date) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON 按 YYYY-MM-DD 形式反序列化并校验真实日期。
+// 先按 JSON 字符串规则解码（普通字符与 \uXXXX 等合法转义混用时
+// 以解码后的实际文本为准），再按 ParseDate 校验；数字、对象等
+// 非字符串值以及解码后仍不合法的文本都拒绝。解码失败时保留原日期。
 func (d *Date) UnmarshalJSON(data []byte) error {
 	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
 		return &InvalidDateError{Value: string(data)}
 	}
-	parsed, err := ParseDate(string(data[1 : len(data)-1]))
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return &InvalidDateError{Value: string(data)}
+	}
+	parsed, err := ParseDate(text)
 	if err != nil {
 		return err
 	}
