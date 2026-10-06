@@ -198,6 +198,71 @@ type manifestEntry struct {
 	End      Date   `json:"end"`
 }
 
+// unmarshalKeyedRecordMap 按档案集合与清册集合共同的读取规则解码一个以编号
+// 为键、逐项保存记录的 JSON 对象；两类集合共同的集合格式、编号解码与重复键
+// 核对只在这里维护一份。
+//
+// 共同读取规则：
+//   - 集合保存为 null 时按空集合处理（字段缺失时根本不会进入这里），保留既有
+//     的空集合兼容行为；
+//   - 值必须恰好是一个 JSON 对象，第一个 token 不是对象左括号即报错；
+//   - 逐个读取对象键：键必须是 JSON 字符串，编号按 JSON 字符串解码后的实际
+//     文本识别——直接写出的编号与通过 Unicode 转义写出、解码后相同的编号是
+//     同一个键。检查只针对集合对象自身的键，记录内部的同名字段（如每份登记
+//     的 "id"、每份清册的 "application_id" 与条目里的 "id"）不是集合键，不会
+//     被当成重复编号；
+//   - 逐键把对应值解码成一条记录（记录内容的结构由类型参数 T 决定），同一
+//     解码后编号出现第二次时立即返回 duplicate(id)：绝不以后一份覆盖前一份，
+//     两份内容是否完全相同、期限、冻结状态或处理日期有何差别都不影响拒绝；
+//   - 最后消费对象结束括号，保证整个值恰好是一个对象；对象之后再拼接任何内容
+//     由外层 json.Unmarshal 的“整值恰好一个 JSON 值”校验拒绝。
+//
+// 两类集合各自不同、不在这里合并的部分由参数传入：fieldName 与 idKind 只用于
+// 错误信息，T 决定每条记录的内容结构，duplicate 按解码出的重复编号构造该集合
+// 自己的重复错误（档案集合说明重复登记，清册集合说明同一申请对应多份清册），
+// 再由 load 统一包装成 ErrCorruptState。
+func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplicate func(id string) error) (map[string]*T, error) {
+	// 集合保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return map[string]*T{}, nil
+	}
+	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成记录，
+	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("retention: %s 字段不是 JSON 对象", fieldName)
+	}
+
+	out := map[string]*T{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		id, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("retention: %s 字段的%s不是 JSON 字符串", fieldName, idKind)
+		}
+		var rec T
+		if err := dec.Decode(&rec); err != nil {
+			return nil, err
+		}
+		if _, dup := out[id]; dup {
+			return nil, duplicate(id)
+		}
+		out[id] = &rec
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // archiveMap 以档案编号为键保存登记记录，并在从 JSON 解码时守住
 // “一个档案编号只能登记一次”的要求。
 //
@@ -214,54 +279,17 @@ type manifestEntry struct {
 // 归一化、改号或补写缺失编号。
 type archiveMap map[string]*archiveRecord
 
-// UnmarshalJSON 逐键解码档案集合，发现重复编号即报错。
-//
-// 编号按 JSON 字符串解码后的实际文本识别：直接写出的 "A-1" 与通过 Unicode
-// 转义写出的同一编号（键写作 "A-" 紧接 1 的 Unicode 转义形式）仍算重复；不同档案登记内容里出现相同
-// 的字段名（如各自的 "id"）属于正常格式，与此无关——那些是登记记录内部的
-// 字段，不是档案集合对象的键。键的解码经过与值内文本一致的 JSON 转义处理，
-// 因此不会因保存文字看起来不同而放行重复编号。
+// UnmarshalJSON 逐键解码档案集合，发现重复编号即报 duplicateArchiveIDError。
+// 集合格式、编号按 JSON 解码实际文本识别、记录内部同名字段不算集合键等
+// 共同读取规则统一由 unmarshalKeyedRecordMap 维护，这里只传入档案集合自己的
+// 字段名、编号称谓与重复错误。
 func (m *archiveMap) UnmarshalJSON(raw []byte) error {
-	// archives 保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		*m = archiveMap{}
-		return nil
-	}
-	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成记录，
-	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	startTok, err := dec.Token()
+	out, err := unmarshalKeyedRecordMap[archiveRecord](raw, "archives", "档案编号",
+		func(id string) error { return &duplicateArchiveIDError{ID: id} })
 	if err != nil {
 		return err
 	}
-	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: archives 字段不是 JSON 对象")
-	}
-
-	out := archiveMap{}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		id, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("retention: archives 字段的档案编号不是 JSON 字符串")
-		}
-		var rec archiveRecord
-		if err := dec.Decode(&rec); err != nil {
-			return err
-		}
-		if _, dup := out[id]; dup {
-			return &duplicateArchiveIDError{ID: id}
-		}
-		out[id] = &rec
-	}
-	// 消费对象结束括号，确保整个值恰好是一个对象。
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	*m = out
+	*m = archiveMap(out)
 	return nil
 }
 
@@ -288,55 +316,17 @@ func (e *duplicateArchiveIDError) Error() string {
 // load 统一包装成 ErrCorruptState。
 type manifestMap map[string]*manifestRecord
 
-// UnmarshalJSON 逐键解码清册集合，发现同一申请编号对应两份清册即报错。
-//
-// 编号按 JSON 字符串解码后的实际文本识别：直接写出的 "APP-1" 与通过
-// Unicode 转义写出的同一编号仍算重复；不同清册记录内部都带有处理日期、
-// 条目、档案编号等同名字段（如各自的 "application_id"、"entries"）属于
-// 正常保存格式，与此无关——那些是清册记录内部的字段，不是清册集合对象的
-// 键。键的解码经过与值内文本一致的 JSON 转义处理，因此不会因保存文字
-// 看起来不同而放行重复编号。
+// UnmarshalJSON 逐键解码清册集合，发现同一申请编号对应两份清册即报
+// duplicateApplicationIDError。集合格式、编号按 JSON 解码实际文本识别、
+// 记录内部同名字段不算集合键等共同读取规则统一由 unmarshalKeyedRecordMap
+// 维护，这里只传入清册集合自己的字段名、编号称谓与重复错误。
 func (m *manifestMap) UnmarshalJSON(raw []byte) error {
-	// manifests 保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		*m = manifestMap{}
-		return nil
-	}
-	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成清册，
-	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	startTok, err := dec.Token()
+	out, err := unmarshalKeyedRecordMap[manifestRecord](raw, "manifests", "申请编号",
+		func(id string) error { return &duplicateApplicationIDError{ID: id} })
 	if err != nil {
 		return err
 	}
-	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: manifests 字段不是 JSON 对象")
-	}
-
-	out := manifestMap{}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		id, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("retention: manifests 字段的申请编号不是 JSON 字符串")
-		}
-		var rec manifestRecord
-		if err := dec.Decode(&rec); err != nil {
-			return err
-		}
-		if _, dup := out[id]; dup {
-			return &duplicateApplicationIDError{ID: id}
-		}
-		out[id] = &rec
-	}
-	// 消费对象结束括号，确保整个值恰好是一个对象。
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	*m = out
+	*m = manifestMap(out)
 	return nil
 }
 
