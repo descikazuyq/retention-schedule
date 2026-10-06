@@ -276,6 +276,86 @@ func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplic
 	return out, nil
 }
 
+// isArchivesFieldName 报告一个解码后的最外层键是否会被 encoding/json 识别为
+// 档案集合字段 archives：与结构体字段的匹配规则一致——逐字相同，或仅 ASCII
+// 大小写不同（Archives、ARCHIVES 等写法单独出现时同样被解码进档案集合）。
+// 键按 JSON 字符串解码后的实际文本比较，因此直接写出的 archives 与通过
+// Unicode 转义写出的同一字段名（如 "\u0061rchives"，解码后同为 archives）也算重复。
+func isArchivesFieldName(key string) bool {
+	const name = "archives"
+	if len(key) != len(name) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := key[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != name[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// checkSingleTopLevelArchives 在整体解码前核对：同一份保存记录的最外层最多
+// 只能出现一次档案集合 archives。
+//
+// 直接把最外层对象解码进 storeData 时，encoding/json 对重复出现的同名字段
+// 会逐次解码到同一个字段上：后一次 archives 的解码结果整体替换前一次，
+// 前一份档案集合中的冻结与其他档案就此消失（例如第一处保存着未解除诉讼
+// 冻结的 A-1，第二处保存成没有冻结的同号档案，读取后只剩后者，销毁资格
+// 会被误判为可以办理）。因此解码前先用流式解码逐键扫描最外层对象：键按
+// JSON 字符串解码后的实际文本识别（转义写法表示同一字段名也算重复），
+// 能被识别为档案集合的写法（含仅大小写不同的写法）合计出现两次或更多次时，
+// 返回可由 ErrCorruptState 识别的错误——错误说明重复的是档案集合 archives
+// 本身，而不是某个档案编号。
+//
+// 拒绝不附带任何挑选：两处集合内容完全一致、各自只含不同编号、其中一处为
+// 空对象或 null，都按同一规则拒绝，绝不合并两处集合、择取最后一份，也不按
+// 哪份保留了更多冻结来选记录；两处集合的保存顺序不影响拒绝结果。
+//
+// 检查只针对最外层字段：各份档案登记内容里各自出现的 id、日期、冻结等同名
+// 字段是正常格式，不会被误判。最外层不是合法 JSON 对象时不在这里报错，
+// 交由后续 json.Unmarshal 按既有规则统一报告。
+func checkSingleTopLevelArchives(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		// 语法错误由后续 json.Unmarshal 统一报告。
+		return nil
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		// 非对象内容由后续 json.Unmarshal 统一报告。
+		return nil
+	}
+	count := 0
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil
+		}
+		// 跳过该键对应的整个值，嵌套内容里的同名字段不参与最外层计数。
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return nil
+		}
+		if isArchivesFieldName(key) {
+			count++
+		}
+	}
+	if count > 1 {
+		return fmt.Errorf(
+			"retention: 保存记录最外层的档案集合 archives 重复出现（共 %d 次），同一份保存记录最多只能保存一个档案集合，记录已损坏: %w",
+			count, ErrCorruptState)
+	}
+	return nil
+}
+
 // archiveMap 以档案编号为键保存登记记录，并在从 JSON 解码时守住
 // “一个档案编号只能登记一次”的要求。
 //
