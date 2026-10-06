@@ -294,11 +294,12 @@ func (s *Store) Revise(in ReviseInput) (RevisionRecord, error) {
 		if !ar.End.Equal(in.OriginalEnd) {
 			return &RetentionEndChangedError{ArchiveID: archiveID, CurrentEnd: ar.End}
 		}
+		revisedOn := in.RevisedOn
 		rec := &revisionRecord{
 			ID:        revisionID,
 			OldEnd:    ar.End,
 			NewEnd:    in.NewEnd,
-			RevisedOn: in.RevisedOn,
+			RevisedOn: &revisedOn,
 			Reason:    reason,
 		}
 		ar.Revisions = append(ar.Revisions, rec)
@@ -327,23 +328,28 @@ func findRevision(data *storeData, revisionID string) (*archiveRecord, *revision
 
 // sameRevision 判断本次提交与已成功的修订内容是否完全一致。
 // 文本比较以去除首尾空白后的值为准（archiveID 与 reason 须已规范化）。
+// 调用前记录已通过 load 校验，修订日期必然存在且有效。
 func sameRevision(owner *archiveRecord, rec *revisionRecord, archiveID string, in ReviseInput, reason string) bool {
 	return owner.ID == archiveID &&
+		rec.RevisedOn != nil && rec.RevisedOn.Equal(in.RevisedOn) &&
 		rec.OldEnd.Equal(in.OriginalEnd) &&
 		rec.NewEnd.Equal(in.NewEnd) &&
-		rec.RevisedOn.Equal(in.RevisedOn) &&
 		rec.Reason == reason
 }
 
 func revisionFromRecord(archiveID string, rec *revisionRecord) RevisionRecord {
-	return RevisionRecord{
+	out := RevisionRecord{
 		RevisionID: rec.ID,
 		ArchiveID:  archiveID,
 		OldEnd:     rec.OldEnd,
 		NewEnd:     rec.NewEnd,
-		RevisedOn:  rec.RevisedOn,
 		Reason:     rec.Reason,
 	}
+	// 通过校验的修订必然带有有效修订日期；防御性保留零值兜底。
+	if rec.RevisedOn != nil {
+		out.RevisedOn = *rec.RevisedOn
+	}
+	return out
 }
 
 // Destroy 办理一次销毁申请。

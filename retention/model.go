@@ -166,10 +166,13 @@ type archiveRecord struct {
 
 // revisionRecord 是一条已保存的截止日修订；文本字段保存时均已去除首尾空白。
 type revisionRecord struct {
-	ID        string `json:"id"`
-	OldEnd    Date   `json:"old_end"`
-	NewEnd    Date   `json:"new_end"`
-	RevisedOn Date   `json:"revised_on"`
+	ID     string `json:"id"`
+	OldEnd Date   `json:"old_end"`
+	NewEnd Date   `json:"new_end"`
+	// RevisedOn 用指针保存：修订缺少修订日期或保存为 null 时保持 nil，
+	// 由 load 的语义校验按损坏报告（并能指出档案编号与修订编号），而不是
+	// 落入 JSON 解析错误或被零值日期顶替。通过校验的修订必然带有有效修订日期。
+	RevisedOn *Date  `json:"revised_on"`
 	Reason    string `json:"reason"`
 }
 
