@@ -89,13 +89,17 @@ func evaluateArchive(data *storeData, id string, processedOn Date) ArchiveCheckR
 		if f.Released {
 			continue
 		}
+		info := ActiveFreezeInfo{
+			FreezeID: f.ID,
+			Reason:   f.Reason,
+		}
+		// 通过校验的冻结必然带有有效冻结日期；防御性保留零值兜底。
+		if f.FrozenOn != nil {
+			info.FrozenOn = *f.FrozenOn
+		}
 		r.Obstructions = append(r.Obstructions, CheckObstruction{
-			Kind: ObstructionActiveFreeze,
-			Freeze: ActiveFreezeInfo{
-				FreezeID: f.ID,
-				Reason:   f.Reason,
-				FrozenOn: f.FrozenOn,
-			},
+			Kind:   ObstructionActiveFreeze,
+			Freeze: info,
 		})
 	}
 	return r

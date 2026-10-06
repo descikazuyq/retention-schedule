@@ -39,7 +39,8 @@ type Store struct {
 // 不是同一个非空白编号（缺失、为 null、空串、只有空白或两处编号不同）、同一档案编号在保存的档案集合中重复登记、
 // 当前截止日或最初截止日、任一修订的原截止日、
 // 新截止日早于起算日、同一档案的冻结历史中
-// 冻结编号重复（解除过的记录仍占用原编号）、已解除冻结缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
+// 冻结编号重复（解除过的记录仍占用原编号）、任一冻结缺少冻结原因或冻结日期、
+// 已解除冻结缺少解除原因或解除日期、解除日期早于冻结日期、已销毁档案与已关闭清册
 // 对应不上、已销毁档案仍带未解除冻结、已关闭清册缺少处理日期、清册处理
 // 日期早于所收录档案销毁时最终生效的保管截止日（提前销毁）、已关闭清册
 // 条目保存的类别、起算日或截止日（须为销毁时最终生效的期限）与档案登记
@@ -107,7 +108,18 @@ func (s *Store) rlock() (func(), error) {
 // 第二个 JSON 值或无法解析的文字，都判为损坏并返回 ErrCorruptState，
 // 绝不只使用前一段内容，也不会改动原文件。
 //
-// JSON 能解析不代表记录合法：任何已解除冻结都必须同时带有非空白的
+// JSON 能解析不代表记录合法：每条冻结保留的原始信息必须与办理冻结时的
+// 要求一致——非空白的冻结原因与有效的冻结日期齐备。冻结原因缺失、为
+// null、为空串或仅含空白都算缺少冻结原因；冻结日期字段缺失或为 null
+// 都算缺少冻结日期（已填写的日期仍须是真实的 YYYY-MM-DD 日期）。这条
+// 要求覆盖未解除与已解除的全部冻结历史，已销毁档案的冻结也不例外：
+// 已解除冻结的解除日期与解除原因再完整，也不能拿解除日期代替冻结日期、
+// 拿解除原因补齐冻结原因；清册归属、条目与处理日期都正确同样不能掩盖
+// 缺项。缺少任一信息时整份保管库判为损坏并返回 ErrCorruptState，错误
+// 信息指明档案编号、冻结编号以及缺少的是冻结原因还是冻结日期（两项同时
+// 缺少时两项都说明）；绝不自动补写日期或原因、删除冻结或更改解除状态。
+//
+// 任何已解除冻结都必须同时带有非空白的
 // 解除原因和有效的解除日期，且解除日期不早于冻结日期——与解除功能
 // 办理时的要求一致。缺少任一信息或日期顺序不成立时，整份保管库同样
 // 判为损坏并返回 ErrCorruptState，错误信息指明涉及的档案与冻结编号。
@@ -296,6 +308,12 @@ func (s *Store) load() (*storeData, error) {
 	if err := validateFreezeIDs(data); err != nil {
 		return nil, err
 	}
+	// 每条冻结保留的原始信息必须与办理冻结时的要求一致：非空白的冻结原因
+	// 与有效的冻结日期齐备。缺少任一项的冻结（无论是否已解除、所属档案
+	// 是否已销毁）都不能当作正常历史使用，必须先按整库损坏拒绝。
+	if err := validateFreezeOriginRecords(data); err != nil {
+		return nil, err
+	}
 	// 语义校验先于任何兼容处理：已解除冻结必须与既有解除功能遵守同一要求——
 	// 解除原因与解除日期齐备，且解除日期不早于冻结日期。
 	// 只有“已解除”标记而缺少任一信息，或解除日期早于冻结日期的记录
@@ -473,6 +491,63 @@ func validateFreezeIDs(data *storeData) error {
 	return nil
 }
 
+// validateFreezeOriginRecords 检查库内每条冻结保留的原始信息是否完整：
+// 非空白的冻结原因与有效的冻结日期必须齐备。
+//
+// 办理新增冻结时，冻结原因（去除首尾空白后不得为空白）与冻结日期（真实的
+// YYYY-MM-DD 日期）都是必填项，保存下来的每条冻结也必须满足同一要求。
+// 保存记录中的冻结原因缺失、为 null、为空串或仅含空白，都算缺少冻结原因；
+// 冻结日期字段缺失或为 null，都算缺少冻结日期（已填写的日期仍由 Date 的
+// 解析校验守住真实日期要求）。缺少任一项的冻结已无法说明自己因何、自何时
+// 冻结，不能当作正常记录交给历史查询与销毁前核对：返回可由 ErrCorruptState
+// 识别的错误，错误信息给出档案编号、冻结编号，并说明缺少的是冻结原因还是
+// 冻结日期；两项同时缺少时两项都说明。
+//
+// 校验覆盖整个保管库全部档案的全部冻结历史——未解除与已解除的冻结都检查，
+// 已销毁档案的冻结同样检查：已解除冻结保存的解除日期与解除原因再完整，也
+// 不能拿解除日期代替冻结日期、拿解除原因补齐冻结原因；清册归属、条目与
+// 处理日期都正确也不能掩盖这条缺项。绝不自动补写日期或原因、删除冻结或
+// 更改解除状态，原保存内容保持原样。没有冻结的档案是合法记录，不在此报错。
+func validateFreezeOriginRecords(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序、冻结按登记顺序检查，
+	// 保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由 validateFreezeIDs 报告。
+			continue
+		}
+		for _, fr := range ar.Freezes {
+			if fr == nil {
+				// 空冻结记录已由 validateFreezeIDs 报告。
+				continue
+			}
+			reasonMissing := strings.TrimSpace(fr.Reason) == ""
+			dateMissing := fr.FrozenOn == nil || fr.FrozenOn.IsZero()
+			switch {
+			case reasonMissing && dateMissing:
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 缺少冻结原因与冻结日期，记录已损坏: %w",
+					id, fr.ID, ErrCorruptState)
+			case reasonMissing:
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 缺少冻结原因，记录已损坏: %w",
+					id, fr.ID, ErrCorruptState)
+			case dateMissing:
+				return fmt.Errorf(
+					"retention: 档案 %s 的冻结 %s 缺少冻结日期，记录已损坏: %w",
+					id, fr.ID, ErrCorruptState)
+			}
+		}
+	}
+	return nil
+}
+
 // validateFreezeReleaseRecords 检查库内全部已解除冻结记录是否完整合法。
 //
 // 正常解除保存的记录必然同时带有非空白的解除原因和有效的解除日期，
@@ -482,6 +557,8 @@ func validateFreezeIDs(data *storeData) error {
 // 校验覆盖整个保管库的全部已解除冻结，与本次办理名单无关：
 // 即使异常记录所属档案已经销毁，也不能把不完整的解除信息当作正常历史。
 // 未解除冻结没有解除日期和原因是合法状态，不在此报错。
+// 调用前 validateFreezeOriginRecords 已确认每条冻结的冻结原因与冻结日期
+// 齐备，这里的日期比较必然有有效的冻结日期可依。
 func validateFreezeReleaseRecords(data *storeData) error {
 	// map 遍历顺序不稳定，按档案编号排序后再检查，保证错误信息稳定。
 	archiveIDs := make([]string, 0, len(data.Archives))
@@ -517,10 +594,10 @@ func validateFreezeReleaseRecords(data *storeData) error {
 				return fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 的解除日期无效，记录已损坏: %w",
 					id, fr.ID, ErrCorruptState)
-			case fr.ReleasedOn.Before(fr.FrozenOn):
+			case fr.ReleasedOn.Before(*fr.FrozenOn):
 				return fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 的解除日期 %s 早于冻结日期 %s，记录已损坏: %w",
-					id, fr.ID, fr.ReleasedOn, fr.FrozenOn, ErrCorruptState)
+					id, fr.ID, fr.ReleasedOn, *fr.FrozenOn, ErrCorruptState)
 			}
 		}
 	}

@@ -174,9 +174,12 @@ type revisionRecord struct {
 }
 
 type freezeRecord struct {
-	ID            string `json:"id"`
-	Reason        string `json:"reason"`
-	FrozenOn      Date   `json:"frozen_on"`
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+	// FrozenOn 用指针保存：冻结缺少冻结日期或保存为 null 时保持 nil，
+	// 由 load 的语义校验按损坏报告（并能指出档案编号与冻结编号），而不是
+	// 落入 JSON 解析错误或被零值日期顶替。通过校验的冻结必然带有有效冻结日期。
+	FrozenOn      *Date  `json:"frozen_on"`
 	Released      bool   `json:"released"`
 	ReleaseReason string `json:"release_reason,omitempty"`
 	ReleasedOn    *Date  `json:"released_on,omitempty"`

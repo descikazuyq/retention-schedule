@@ -161,7 +161,7 @@ func (s *Store) Freeze(in FreezeInput) error {
 		ar.Freezes = append(ar.Freezes, &freezeRecord{
 			ID:       freezeID,
 			Reason:   reason,
-			FrozenOn: in.FrozenOn,
+			FrozenOn: &in.FrozenOn,
 		})
 		return nil
 	})
@@ -208,9 +208,10 @@ func (s *Store) Release(in ReleaseInput) error {
 			return fmt.Errorf("retention: 档案 %s 的冻结 %s 已经解除，不能重复解除: %w",
 				archiveID, freezeID, ErrFreezeAlreadyReleased)
 		}
-		if in.ReleasedOn.Before(fr.FrozenOn) {
+		// 通过 load 校验的冻结必然带有有效冻结日期。
+		if in.ReleasedOn.Before(*fr.FrozenOn) {
 			return fmt.Errorf("retention: 解除日期 %s 早于冻结 %s 的冻结日期 %s: %w",
-				in.ReleasedOn, freezeID, fr.FrozenOn, ErrReleaseBeforeFreeze)
+				in.ReleasedOn, freezeID, *fr.FrozenOn, ErrReleaseBeforeFreeze)
 		}
 		fr.Released = true
 		fr.ReleaseReason = reason
@@ -460,9 +461,12 @@ func freezeFromRecord(fr *freezeRecord) FreezeRecord {
 	out := FreezeRecord{
 		ID:            fr.ID,
 		Reason:        fr.Reason,
-		FrozenOn:      fr.FrozenOn,
 		Released:      fr.Released,
 		ReleaseReason: fr.ReleaseReason,
+	}
+	// 通过校验的冻结必然带有有效冻结日期；防御性保留零值兜底。
+	if fr.FrozenOn != nil {
+		out.FrozenOn = *fr.FrozenOn
 	}
 	if fr.ReleasedOn != nil {
 		out.ReleasedOn = *fr.ReleasedOn
