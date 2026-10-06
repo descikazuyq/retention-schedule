@@ -46,7 +46,10 @@ type Store struct {
 // 对应不上、已销毁档案仍带未解除冻结、已关闭清册缺少处理日期、清册处理
 // 日期早于所收录档案销毁时最终生效的保管截止日（提前销毁）、已关闭清册
 // 条目保存的类别、起算日或截止日（须为销毁时最终生效的期限）与档案登记
-// 内容不一致、修订记录衔接不上、修订历史中存在早于起算日的截止日、成功修订编号在保存历史中不唯一或与已关闭
+// 内容不一致、修订记录衔接不上、修订历史中存在早于起算日的截止日、任一已保存
+// 修订缺少非空白的修订原因或有效的修订日期（原因缺失、为 null、空串或仅含
+// 空白算缺少原因，修订日期缺失或为 null 算缺少日期，已填写但不是合法日历
+// 日期同样损坏）、成功修订编号在保存历史中不唯一或与已关闭
 // 清册的申请编号相同、同一申请编号在保存的清册集合中对应多份清册、
 // 用于找到清册的申请编号与清册内容里的 application_id 不是同一个非空白
 // 编号（查找键为空白，或清册内容的 application_id 缺失、为 null、空串、
@@ -278,6 +281,20 @@ func (s *Store) rlock() (func(), error) {
 // 判为损坏并返回 ErrCorruptState；绝不合并记录或挑选其中一条继续使用。
 // 错误信息指明冲突编号：同档案重复时指出该档案，跨档案重复时指出两份
 // 档案，与清册冲突时指出修订所属档案与清册申请编号。
+//
+// 每条已保存修订还必须保留提交修订时要求填写的办理信息：非空白的修订
+// 原因与有效的修订日期齐备，历史才能说明这次调整是在何时、因何办理的。
+// 保存记录中的修订原因缺失、为 null、为空串或仅含空白，都算缺少修订
+// 原因；修订日期字段缺失或为 null，都算缺少修订日期（已填写的日期仍须
+// 是真实的 YYYY-MM-DD 日期，否则由 JSON 解码直接判损坏）。命中任一缺项
+// 都按保存记录损坏拒绝打开（ErrCorruptState），错误信息指出档案编号、
+// 修订编号以及缺少的是修订原因还是修订日期，同一条修订两项同时缺少时
+// 两项都说明。这项要求覆盖每一条成功修订，而不只是最后一条：先延长、
+// 后缩短的历史中中间那次修订缺少原因时，不能因最终截止日合法、全部期限
+// 前后衔接就接受；仍被冻结或已经销毁档案的修订历史也遵守同一要求，清册
+// 的归属、条目与处理日期都正确仍不能掩盖修订信息缺项。绝不补写原因、
+// 借用冻结或销毁日期，也不删除那次修订来继续使用。没有修订记录的旧档案
+// 不受影响，继续沿用既有兼容行为。
 func (s *Store) load() (*storeData, error) {
 	raw, err := os.ReadFile(s.statePath())
 	if err != nil {
@@ -409,6 +426,14 @@ func (s *Store) load() (*storeData, error) {
 	// 成功修订编号在整个保管库内只能对应一条保存的修订记录，且不能与
 	// 已关闭清册的申请编号相同——与办理时全库唯一、编号互不占用的要求一致。
 	if err := validateRevisionIDs(data); err != nil {
+		return nil, err
+	}
+	// 每条已保存修订保留的办理信息必须与提交修订时的要求一致：非空白的
+	// 修订原因与有效的修订日期齐备。缺少任一项的修订（无论期限衔接是否
+	// 完整、所属档案是否仍被冻结或已经销毁）都不能当作正常历史使用，必须
+	// 按整库损坏拒绝。已填写但不是合法日历日期的修订日期由 JSON 解码直接
+	// 判损坏。
+	if err := validateRevisionOriginRecords(data); err != nil {
 		return nil, err
 	}
 	return data, nil
@@ -1226,6 +1251,72 @@ func validateRevisionIDs(data *storeData) error {
 			return fmt.Errorf(
 				"retention: 档案 %s 的修订编号 %s 与已关闭清册的申请编号 %s 相同，保存记录已损坏: %w",
 				owner, appID, appID, ErrCorruptState)
+		}
+	}
+	return nil
+}
+
+// validateRevisionOriginRecords 检查库内每条已保存修订保留的办理信息是否完整：
+// 非空白的修订原因与有效的修订日期必须齐备。
+//
+// 提交修订时，修订原因（去除首尾空白后不得为空白）与修订日期（真实的
+// YYYY-MM-DD 日期）都是必填项，保存下来的每条修订也必须满足同一要求：
+// 修订历史必须能说明这次调整是在何时、因何办理的。保存记录中的修订原因
+// 缺失、为 null、为空串或仅含空白，都算缺少修订原因；修订日期字段缺失或
+// 为 null，都算缺少修订日期。已填写的修订日期仍由 Date 的解析校验守住
+// 真实日期要求——不是合法日历日期的值在 JSON 解码阶段就使整库判损坏。
+// 缺少原因或日期任一项的修订已无法说明自己因何、于何时办理，不能当作
+// 正常记录交给历史查询、销毁前核对与各项办理：返回可由 ErrCorruptState
+// 识别的错误，错误信息给出档案编号、修订编号，并说明缺少的是修订原因
+// 还是修订日期；同一条修订两项同时缺少时两项都说明。
+//
+// 这项要求覆盖每一条成功修订，而不只是最后一条：一份档案先延长、随后又
+// 缩短时，中间那次修订缺少原因，不能因为最终截止日合法、全部期限前后
+// 衔接就接受它。校验覆盖整个保管库全部档案的全部修订历史——仍被冻结或
+// 已经销毁档案的修订同样检查：清册的归属、条目与处理日期再正确，也不能
+// 掩盖修订办理信息缺项；不能补写原因、借用冻结或销毁日期，也不能删除
+// 那次修订来继续使用。绝不自动补写日期或原因或删除修订，原保存内容保持
+// 原样。没有修订记录的旧档案是合法记录，不在此报错，仍沿用既有兼容行为。
+//
+// load 在每次查询、核对与办理前都会重新执行校验，因此保管库打开后保存
+// 内容才出现这种缺项时，下一次使用有效输入（即使本次查询、核对或办理的
+// 是另一份正常档案）也按整库记录损坏失败：不返回正常历史或部分核对结果，
+// 不产生业务变更，原保存内容保持原样。
+func validateRevisionOriginRecords(data *storeData) error {
+	// map 遍历顺序不稳定，按档案编号排序、修订按成功办理顺序检查，
+	// 保证错误信息稳定。
+	archiveIDs := make([]string, 0, len(data.Archives))
+	for id := range data.Archives {
+		archiveIDs = append(archiveIDs, id)
+	}
+	sort.Strings(archiveIDs)
+	for _, id := range archiveIDs {
+		ar := data.Archives[id]
+		if ar == nil {
+			// 缺失的登记记录已由前面的校验报告。
+			continue
+		}
+		for _, rec := range ar.Revisions {
+			if rec == nil {
+				// 空修订记录已由 validateRevisionContinuity 报告。
+				continue
+			}
+			reasonMissing := strings.TrimSpace(rec.Reason) == ""
+			dateMissing := rec.RevisedOn == nil || rec.RevisedOn.IsZero()
+			switch {
+			case reasonMissing && dateMissing:
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订 %s 缺少修订原因与修订日期，记录已损坏: %w",
+					id, rec.ID, ErrCorruptState)
+			case reasonMissing:
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订 %s 缺少修订原因，记录已损坏: %w",
+					id, rec.ID, ErrCorruptState)
+			case dateMissing:
+				return fmt.Errorf(
+					"retention: 档案 %s 的修订 %s 缺少修订日期，记录已损坏: %w",
+					id, rec.ID, ErrCorruptState)
+			}
 		}
 	}
 	return nil
