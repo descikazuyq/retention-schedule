@@ -369,23 +369,30 @@ type storeData struct {
 }
 
 // UnmarshalJSON 逐键解码保存记录的最外层对象，守住“同一份保存记录的最外层
-// 最多只能出现一次档案集合”的要求。
+// 最多只能出现一次档案集合与一次清册集合”的要求。
 //
 // 直接把最外层对象解码进结构体时，encoding/json 对同名字段只会保留最后一个
 // 值：保存内容中若写了两次 archives，前一次保存的档案集合会被后一次静默替换
 // （例如第一处保存着带未解除诉讼冻结的 A-1，第二处保存成没有冻结的同号档案，
-// 读取后只剩后者，销毁资格会被误判为可以办理）。因此这里逐个读取最外层字段名：
-// 字段名按 JSON 字符串解码后的实际文本识别——直接写出的 "archives" 与通过
-// Unicode 转义写出、解码后同为 archives 的写法是同一个字段；现有能识别为档案
-// 集合的大小写写法（如 "Archives"，沿用 encoding/json 的大小写不敏感匹配）
-// 单独出现时继续可读，与 "archives" 混用重复保存同样算重复。同一编号第二次
-// 出现时立即返回 duplicateArchivesFieldError：两处集合内容是否完全一致、是否
-// 只含不同编号、其中一处是否为空对象或 null，都不影响拒绝——绝不合并、不取
-// 最后一份，也不按哪份保留了更多冻结挑选，拒绝结果与两处的保存顺序无关。
+// 读取后只剩后者，销毁资格会被误判为可以办理）；写两次 manifests 时，前一份
+// 清册集合同样会被后一份整批替换——两份清册可能各自的条目、归属都正确且都
+// 满足到期规则（例如 APP-1 收录截止日 2025-01-10 的已销毁档案，两处处理日期
+// 分别为 2025-01-10 和 2025-01-11），仅留下后一份时保管库仍能打开，取回的
+// 处理日期却随保存顺序变化，已关闭清册的历史不能这样被覆盖。因此这里逐个
+// 读取最外层字段名：字段名按 JSON 字符串解码后的实际文本识别——直接写出的
+// "archives"/"manifests" 与通过 Unicode 转义写出、解码后同名的写法是同一个
+// 字段；现有能识别为这两个集合的大小写写法（如 "Archives"/"Manifests"，沿用
+// encoding/json 的大小写不敏感匹配）单独出现时继续可读，与小写写法混用重复
+// 保存同样算重复。同一字段第二次出现时立即返回对应的重复字段错误：两处集合
+// 内容是否完全一致、是否只含不同编号/申请、其中一处是否为空对象或 null，都
+// 不影响拒绝——绝不合并、不取最后一份，也不按内容挑选，拒绝结果与两处的
+// 保存顺序无关。
 //
-// 检查只针对最外层的档案集合字段：各份档案登记内容里各自出现的 id、日期、
-// 冻结等同名字段是正常保存格式，不会被误判为重复的档案集合；档案集合内部
-// 同一档案编号出现两次仍由 archiveMap.UnmarshalJSON 按既有规则拒绝。
+// 检查只针对最外层的档案集合与清册集合字段：各份档案登记内容里各自出现的
+// id、日期、冻结字段，以及各份清册内部各自带有的申请编号、处理日期和条目
+// 字段，都是正常保存格式，不会被误判为最外层集合重复；档案集合内部同一
+// 档案编号出现两次仍由 archiveMap.UnmarshalJSON 拒绝，清册集合内部同一申请
+// 编号对应两份清册仍由 manifestMap.UnmarshalJSON 拒绝。
 func (d *storeData) UnmarshalJSON(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	startTok, err := dec.Token()
@@ -396,6 +403,7 @@ func (d *storeData) UnmarshalJSON(raw []byte) error {
 		return fmt.Errorf("retention: 保存记录不是 JSON 对象")
 	}
 	archivesSeen := false
+	manifestsSeen := false
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -415,6 +423,12 @@ func (d *storeData) UnmarshalJSON(raw []byte) error {
 				return err
 			}
 		case strings.EqualFold(key, "manifests"):
+			// 与 archives 相同：最外层清册集合出现两次或更多次即判损坏，
+			// 绝不让后一处集合整批替换前一处。
+			if manifestsSeen {
+				return &duplicateManifestsFieldError{}
+			}
+			manifestsSeen = true
 			if err := dec.Decode(&d.Manifests); err != nil {
 				return err
 			}
@@ -444,6 +458,16 @@ type duplicateArchivesFieldError struct{}
 
 func (e *duplicateArchivesFieldError) Error() string {
 	return "retention: 保存记录最外层的档案集合 archives 出现了多次"
+}
+
+// duplicateManifestsFieldError 表示保存记录的最外层出现了两次或更多次清册
+// 集合 manifests。它在包内由 load 统一包装成可由 ErrCorruptState 识别的错误；
+// 错误说明重复的是清册集合本身，不涉及任何具体申请编号——清册集合内部同一
+// 申请编号对应多份清册是另一类重复，由 duplicateApplicationIDError 报告。
+type duplicateManifestsFieldError struct{}
+
+func (e *duplicateManifestsFieldError) Error() string {
+	return "retention: 保存记录最外层的清册集合 manifests 出现了多次"
 }
 
 func newStoreData() *storeData {
