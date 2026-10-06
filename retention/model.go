@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // 以下类型是对外的只读视图，由查询方法复制内部状态生成，
@@ -365,6 +366,84 @@ type storeData struct {
 	Version   int         `json:"version"`
 	Archives  archiveMap  `json:"archives"`
 	Manifests manifestMap `json:"manifests"`
+}
+
+// UnmarshalJSON 逐键解码保存记录的最外层对象，守住“同一份保存记录的最外层
+// 最多只能出现一次档案集合”的要求。
+//
+// 直接把最外层对象解码进结构体时，encoding/json 对同名字段只会保留最后一个
+// 值：保存内容中若写了两次 archives，前一次保存的档案集合会被后一次静默替换
+// （例如第一处保存着带未解除诉讼冻结的 A-1，第二处保存成没有冻结的同号档案，
+// 读取后只剩后者，销毁资格会被误判为可以办理）。因此这里逐个读取最外层字段名：
+// 字段名按 JSON 字符串解码后的实际文本识别——直接写出的 "archives" 与通过
+// Unicode 转义写出、解码后同为 archives 的写法是同一个字段；现有能识别为档案
+// 集合的大小写写法（如 "Archives"，沿用 encoding/json 的大小写不敏感匹配）
+// 单独出现时继续可读，与 "archives" 混用重复保存同样算重复。同一编号第二次
+// 出现时立即返回 duplicateArchivesFieldError：两处集合内容是否完全一致、是否
+// 只含不同编号、其中一处是否为空对象或 null，都不影响拒绝——绝不合并、不取
+// 最后一份，也不按哪份保留了更多冻结挑选，拒绝结果与两处的保存顺序无关。
+//
+// 检查只针对最外层的档案集合字段：各份档案登记内容里各自出现的 id、日期、
+// 冻结等同名字段是正常保存格式，不会被误判为重复的档案集合；档案集合内部
+// 同一档案编号出现两次仍由 archiveMap.UnmarshalJSON 按既有规则拒绝。
+func (d *storeData) UnmarshalJSON(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: 保存记录不是 JSON 对象")
+	}
+	archivesSeen := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: 保存记录最外层的字段名不是 JSON 字符串")
+		}
+		switch {
+		case strings.EqualFold(key, "archives"):
+			if archivesSeen {
+				return &duplicateArchivesFieldError{}
+			}
+			archivesSeen = true
+			if err := dec.Decode(&d.Archives); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "manifests"):
+			if err := dec.Decode(&d.Manifests); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "version"):
+			if err := dec.Decode(&d.Version); err != nil {
+				return err
+			}
+		default:
+			// 未知字段与既有行为一致：跳过不校验。
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return err
+			}
+		}
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// duplicateArchivesFieldError 表示保存记录的最外层出现了两次或更多次档案
+// 集合 archives。它在包内由 load 统一包装成可由 ErrCorruptState 识别的错误；
+// 错误说明重复的是档案集合本身，不涉及任何具体档案编号。
+type duplicateArchivesFieldError struct{}
+
+func (e *duplicateArchivesFieldError) Error() string {
+	return "retention: 保存记录最外层的档案集合 archives 出现了多次"
 }
 
 func newStoreData() *storeData {
