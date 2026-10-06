@@ -3,6 +3,7 @@ package retention
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -154,15 +155,17 @@ type CheckReport struct {
 // 以下类型是持久化到磁盘的数据结构，仅在包内使用。
 
 type archiveRecord struct {
-	ID         string            `json:"id"`
-	Category   string            `json:"category"`
-	Start      Date              `json:"start"`
-	End        Date              `json:"end"`
-	InitialEnd Date              `json:"initial_end,omitempty"`
-	Destroyed  bool              `json:"destroyed"`
-	ManifestID string            `json:"manifest_id,omitempty"`
-	Freezes    []*freezeRecord   `json:"freezes"`
-	Revisions  []*revisionRecord `json:"revisions,omitempty"`
+	ID         string `json:"id"`
+	Category   string `json:"category"`
+	Start      Date   `json:"start"`
+	End        Date   `json:"end"`
+	InitialEnd Date   `json:"initial_end,omitempty"`
+	Destroyed  bool   `json:"destroyed"`
+	ManifestID string `json:"manifest_id,omitempty"`
+	// Freezes 是这份档案全部冻结及解除历史的唯一保存位置。
+	// UnmarshalJSON 守住“同一份档案的保存内容中冻结列表最多出现一次”。
+	Freezes   []*freezeRecord   `json:"freezes"`
+	Revisions []*revisionRecord `json:"revisions,omitempty"`
 }
 
 // revisionRecord 是一条已保存的截止日修订；文本字段保存时均已去除首尾空白。
@@ -263,6 +266,12 @@ func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplic
 		}
 		var rec T
 		if err := dec.Decode(&rec); err != nil {
+			// 一份档案的登记内容里冻结列表字段重复时，把该条记录的查找编号
+			// 带到错误上，使最终错误信息能指出档案编号；其他解码错误保持原样。
+			var dupFreezes *duplicateFreezesFieldError
+			if errors.As(err, &dupFreezes) {
+				dupFreezes.LookupID = id
+			}
 			return nil, err
 		}
 		if _, dup := out[id]; dup {
@@ -275,6 +284,103 @@ func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplic
 		return nil, err
 	}
 	return out, nil
+}
+
+// archiveRecordAlias 与 archiveRecord 字段完全相同但不带任何方法，借用
+// encoding/json 默认的结构解码，避免 archiveRecord.UnmarshalJSON 递归调用自己。
+type archiveRecordAlias archiveRecord
+
+// UnmarshalJSON 逐字段解码一份档案的登记内容，守住“同一份档案的保存内容中
+// 冻结列表字段 freezes 最多只能出现一次”的要求。
+//
+// 直接把登记内容解码进结构体时，encoding/json 对同名键只会保留最后一个值：
+// 一份档案先保存包含未解除诉讼冻结的 freezes、随后又保存一个空的 freezes 时，
+// 普通读取只会留下后一个空列表——读取仍能成功，原冻结从历史中消失，到期后的
+// 销毁前核对会误报可以办理。冻结及解除历史不能这样被覆盖。
+//
+// 因此这里逐个读取档案记录的字段名：字段名按 JSON 字符串解码后的实际文本识别
+// ——直接写出的 "freezes" 与通过 Unicode 转义写出、解码后相同的写法是同一个
+// 字段；现有能识别为冻结列表的大小写写法（如 "Freezes"，沿用 encoding/json 的
+// 大小写不敏感匹配）单独出现时继续可读，与标准写法混用重复保存同样算重复。
+// 冻结列表第二次出现时立即返回 duplicateFreezesFieldError：两处列表完全相同、
+// 分别保存不同冻结、其中一处为空列表或 null，都不影响拒绝——绝不合并、不挑选
+// 其中一份，也不重新保存来消除重复，拒绝结果与两处的保存顺序无关。
+//
+// 检查只针对这份档案自己保存内容里的冻结列表字段：不同档案各自带有的 freezes
+// 是正常保存格式，不会被合在一起计数，也不影响最外层字段与集合键的既有核对。
+// 冻结列表缺省、仅一次为 null 或仅有一个空列表时继续表示没有冻结；合法列表里
+// 的全部冻结和解除历史按原顺序保留，其余字段沿用默认解码规则。
+func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: 档案登记记录不是 JSON 对象")
+	}
+	var alias archiveRecordAlias
+	freezesSeen := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: 档案登记记录的字段名不是 JSON 字符串")
+		}
+		if strings.EqualFold(key, "freezes") {
+			// 重复检查必须先于解码：即使第二处为空列表或 null，也不能让它把
+			// 第一处保存的冻结及解除历史整批覆盖成空列表后继续使用。
+			if freezesSeen {
+				return &duplicateFreezesFieldError{}
+			}
+			freezesSeen = true
+			if err := dec.Decode(&alias.Freezes); err != nil {
+				return err
+			}
+			continue
+		}
+		// 其余字段逐个按默认规则解码（含 Date 校验与大小写不敏感匹配）；
+		// 未知名的字段与既有行为一致地跳过不校验。
+		if err := decodeArchiveRecordField(&alias, key, dec); err != nil {
+			return err
+		}
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	*r = archiveRecord(alias)
+	return nil
+}
+
+// decodeArchiveRecordField 按字段名解码冻结列表之外的单个档案登记字段；
+// 未知名的字段与既有行为一致地跳过不校验。
+func decodeArchiveRecordField(alias *archiveRecordAlias, key string, dec *json.Decoder) error {
+	switch {
+	case strings.EqualFold(key, "id"):
+		return dec.Decode(&alias.ID)
+	case strings.EqualFold(key, "category"):
+		return dec.Decode(&alias.Category)
+	case strings.EqualFold(key, "start"):
+		return dec.Decode(&alias.Start)
+	case strings.EqualFold(key, "end"):
+		return dec.Decode(&alias.End)
+	case strings.EqualFold(key, "initial_end"):
+		return dec.Decode(&alias.InitialEnd)
+	case strings.EqualFold(key, "destroyed"):
+		return dec.Decode(&alias.Destroyed)
+	case strings.EqualFold(key, "manifest_id"):
+		return dec.Decode(&alias.ManifestID)
+	case strings.EqualFold(key, "revisions"):
+		return dec.Decode(&alias.Revisions)
+	default:
+		// 未知字段与既有行为一致：跳过不校验。
+		var skip json.RawMessage
+		return dec.Decode(&skip)
+	}
 }
 
 // archiveMap 以档案编号为键保存登记记录，并在从 JSON 解码时守住
@@ -469,6 +575,19 @@ type duplicateManifestsFieldError struct{}
 
 func (e *duplicateManifestsFieldError) Error() string {
 	return "retention: 保存记录最外层的清册集合 manifests 出现了多次"
+}
+
+// duplicateFreezesFieldError 表示某一份档案的登记内容里冻结列表字段 freezes
+// 出现了两次或更多次。它在包内由 load 统一包装成可由 ErrCorruptState 识别的
+// 错误；错误说明重复的是冻结列表 freezes 本身，并给出该条记录的档案编号
+// （LookupID 在集合逐键解码时按查找键填入），而不是误报某个冻结编号重复。
+type duplicateFreezesFieldError struct {
+	// LookupID 是保存的档案集合中找到这条记录的编号，用于错误信息定位档案。
+	LookupID string
+}
+
+func (e *duplicateFreezesFieldError) Error() string {
+	return "retention: 档案 " + e.LookupID + " 的保存内容里冻结列表 freezes 出现了多次"
 }
 
 func newStoreData() *storeData {
