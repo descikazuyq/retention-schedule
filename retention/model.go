@@ -182,7 +182,11 @@ type freezeRecord struct {
 	FrozenOn      *Date  `json:"frozen_on"`
 	Released      bool   `json:"released"`
 	ReleaseReason string `json:"release_reason,omitempty"`
-	ReleasedOn    *Date  `json:"released_on,omitempty"`
+	// ReleasedOn 用指针保存：字段缺失或保存为 null 时保持 nil（encoding/json
+	// 对 null 指针不调用 Date.UnmarshalJSON），由 load 的语义校验按损坏报告；
+	// 一旦给出字符串，Date.UnmarshalJSON 按 JSON 解码后的实际文本校验真实
+	// 日期，非法文本（含转义后出现加号、空白等）直接使解码失败。
+	ReleasedOn *Date `json:"released_on,omitempty"`
 }
 
 type manifestRecord struct {
