@@ -258,21 +258,24 @@ func (s *Store) load() (*storeData, error) {
 	// 合法对象后面再拼接任何内容都会在这里报错。
 	if err := json.Unmarshal(raw, data); err != nil {
 		// 集合中同一键出现多次属于记录损坏而非单纯的语法错误，绝不以后一份
-		// 记录覆盖前一份后继续使用。
-		var dupArchiveID *duplicateArchiveIDError
-		if errors.As(err, &dupArchiveID) {
-			// 错误信息给出重复的档案编号并说明登记重复。
-			return nil, fmt.Errorf(
-				"retention: 档案编号 %s 在保存的档案集合中重复登记，同一编号只能对应一份登记记录，记录已损坏: %w",
-				dupArchiveID.ID, ErrCorruptState)
-		}
-		var dupAppID *duplicateApplicationIDError
-		if errors.As(err, &dupAppID) {
-			// 错误信息给出重复的申请编号并说明该编号对应多份清册：
-			// 已成功的销毁申请只能对应一份已关闭清册，重复保存不是申请重试。
-			return nil, fmt.Errorf(
-				"retention: 申请编号 %s 在保存的清册集合中对应多份清册，一个已成功的销毁申请只能对应一份已关闭清册，记录已损坏: %w",
-				dupAppID.ID, ErrCorruptState)
+		// 记录覆盖前一份后继续使用。档案集合与清册集合共用同一条逐键读取
+		// 规则，重复编号错误只带“哪个集合、哪个编号”，这里按集合保留各自的
+		// 错误说明，不把两者退化成没有具体对象的解析失败。
+		var dupKey *uniqueKeyError
+		if errors.As(err, &dupKey) {
+			switch dupKey.Collection {
+			case archiveCollection:
+				// 错误信息给出重复的档案编号并说明登记重复。
+				return nil, fmt.Errorf(
+					"retention: 档案编号 %s 在保存的档案集合中重复登记，同一编号只能对应一份登记记录，记录已损坏: %w",
+					dupKey.ID, ErrCorruptState)
+			case manifestCollection:
+				// 错误信息给出重复的申请编号并说明该编号对应多份清册：
+				// 已成功的销毁申请只能对应一份已关闭清册，重复保存不是申请重试。
+				return nil, fmt.Errorf(
+					"retention: 申请编号 %s 在保存的清册集合中对应多份清册，一个已成功的销毁申请只能对应一份已关闭清册，记录已损坏: %w",
+					dupKey.ID, ErrCorruptState)
+			}
 		}
 		return nil, fmt.Errorf("retention: 状态文件内容无法解析: %v: %w", err, ErrCorruptState)
 	}

@@ -198,156 +198,172 @@ type manifestEntry struct {
 	End      Date   `json:"end"`
 }
 
-// archiveMap 以档案编号为键保存登记记录，并在从 JSON 解码时守住
-// “一个档案编号只能登记一次”的要求。
-//
-// 直接把对象解码进普通 map 时，encoding/json 对同名键只会保留最后一个
-// 值：保存内容中若写了两份同编号登记，前一份会被静默覆盖（例如前一份带着
-// 未解除的诉讼冻结、后一份冻结列表为空，读取后只剩后一份，销毁资格会被
-// 误判）。除键不重复外，每条记录的身份还必须自洽：用于找到该记录的键与
-// 记录内容里的 id 必须同为非空白文本且逐字相同。键与 id 是两处独立保存的
-// 文本，普通解码不会核对它们，可能出现挂在 A-1 名下、id 却写成 A-2，或
-// id 缺失、为 null、空串、只有空白的记录——按 A-1 查到的历史会标着 A-2，
-// 销毁还可能把 A-2 写进清册。这层检查不在 UnmarshalJSON 中完成（解码只
-// 负责拒绝重复键），而由 load 的 validateArchiveIdentity 在进入任何业务
-// 操作前统一核对，命中即包装成 ErrCorruptState：绝不做去空白、大小写
-// 归一化、改号或补写缺失编号。
-type archiveMap map[string]*archiveRecord
+// uniqueKeyCollection 标识保存的编号键集合种类，用于在同一条集合读取规则里
+// 区分两类集合各自的记录内容与错误说明。
+type uniqueKeyCollection int
 
-// UnmarshalJSON 逐键解码档案集合，发现重复编号即报错。
+const (
+	// archiveCollection 是状态文件中的档案集合（archives 字段）。
+	archiveCollection uniqueKeyCollection = iota
+	// manifestCollection 是状态文件中的清册集合（manifests 字段）。
+	manifestCollection
+)
+
+// field 返回该集合在状态文件中的字段名，用于格式类解析错误。
+func (c uniqueKeyCollection) field() string {
+	switch c {
+	case archiveCollection:
+		return "archives"
+	case manifestCollection:
+		return "manifests"
+	}
+	return "未知集合"
+}
+
+// keyName 返回该集合键编号的称呼，用于“键不是 JSON 字符串”类解析错误。
+func (c uniqueKeyCollection) keyName() string {
+	switch c {
+	case archiveCollection:
+		return "档案编号"
+	case manifestCollection:
+		return "申请编号"
+	}
+	return "编号"
+}
+
+// decodeUniqueKeyedObject 逐键解码一个以编号为键、编号在集合内唯一的 JSON
+// 对象集合，是档案集合与清册集合共用的同一条读取规则。
 //
-// 编号按 JSON 字符串解码后的实际文本识别：直接写出的 "A-1" 与通过 Unicode
-// 转义写出的同一编号（键写作 "A-" 紧接 1 的 Unicode 转义形式）仍算重复；不同档案登记内容里出现相同
-// 的字段名（如各自的 "id"）属于正常格式，与此无关——那些是登记记录内部的
-// 字段，不是档案集合对象的键。键的解码经过与值内文本一致的 JSON 转义处理，
-// 因此不会因保存文字看起来不同而放行重复编号。
-func (m *archiveMap) UnmarshalJSON(raw []byte) error {
-	// archives 保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
+// 直接把对象解码进普通 map 时，encoding/json 对同名键只会保留最后一个值：
+// 保存内容中若用同一编号写了两份记录，前一份会被静默覆盖，读取结果随保存
+// 顺序改变（档案可能被后一份无冻结登记顶替，清册可能被后一份不同处理日期
+// 的记录顶替）。因此这里不用普通 map 解码，而是统一守住两类集合共有的规则：
+//   - 集合保存为 null 与字段缺失等价，连同空对象一起按空集合处理（与既有
+//     兼容行为一致）；
+//   - 集合必须是一个 JSON 对象，键必须是 JSON 字符串；
+//   - 键按 JSON 字符串解码后的实际文本识别：直接写出的编号与通过 Unicode
+//     转义写出、解码后相同的编号视为同一编号；不同记录内部的同名字段（登记
+//     的 id、冻结的 id，或清册的 application_id、processed_on、entries、条目
+//     id）是记录内部字段，不是集合对象的键，不参与编号重复判断；
+//   - 每个键把对应的原始片段解码成一条记录，同一编号出现两次时绝不以后一份
+//     覆盖前一份，也不按期限、冻结状态或处理日期挑选，而是返回带集合标识的
+//     uniqueKeyError，由 load 统一包装成 ErrCorruptState，并保留该集合自己的
+//     错误说明（档案集合说明重复登记，清册集合说明同一申请对应多份清册）。
+//
+// 记录本身的内容合法性（登记身份、期限、冻结历史、清册条目等）不在此判断，
+// 由各自的记录类型与 load 的后续校验负责；这里只消除两类集合在集合格式、
+// 编号解码与编号唯一上的重复维护。
+func decodeUniqueKeyedObject[T any](raw []byte, collection uniqueKeyCollection) (map[string]*T, error) {
+	// 集合保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		*m = archiveMap{}
-		return nil
+		return map[string]*T{}, nil
 	}
 	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成记录，
 	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	startTok, err := dec.Token()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: archives 字段不是 JSON 对象")
+		return nil, fmt.Errorf("retention: %s 字段不是 JSON 对象", collection.field())
 	}
 
-	out := archiveMap{}
+	out := map[string]*T{}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		id, ok := keyTok.(string)
 		if !ok {
-			return fmt.Errorf("retention: archives 字段的档案编号不是 JSON 字符串")
+			return nil, fmt.Errorf("retention: %s 字段的%s不是 JSON 字符串", collection.field(), collection.keyName())
 		}
-		var rec archiveRecord
+		var rec T
 		if err := dec.Decode(&rec); err != nil {
-			return err
+			return nil, err
 		}
 		if _, dup := out[id]; dup {
-			return &duplicateArchiveIDError{ID: id}
+			return nil, &uniqueKeyError{Collection: collection, ID: id}
 		}
 		out[id] = &rec
 	}
 	// 消费对象结束括号，确保整个值恰好是一个对象。
 	if _, err := dec.Token(); err != nil {
-		return err
+		return nil, err
 	}
-	*m = out
-	return nil
+	return out, nil
 }
 
-// duplicateArchiveIDError 表示保存的档案集合中同一编号出现了多次。
-// 它在包内由 load 统一包装成可由 ErrCorruptState 识别的错误。
-type duplicateArchiveIDError struct {
-	ID string
+// uniqueKeyError 表示保存的某个编号键集合中同一编号出现了多次。它只携带
+// “哪个集合、哪个编号重复”这一两类集合共有的事实；各自的错误说明（档案集合
+// 说明重复登记，清册集合说明同一申请对应多份清册）由 load 按 Collection 区分
+// 后统一包装成可由 ErrCorruptState 识别的错误，不会退化成没有具体对象的解析
+// 失败。
+type uniqueKeyError struct {
+	Collection uniqueKeyCollection
+	ID         string
 }
 
-func (e *duplicateArchiveIDError) Error() string {
-	return "retention: 档案编号 " + e.ID + " 在保存的档案集合中登记了多次"
-}
-
-// manifestMap 以申请编号为键保存已关闭清册，并在从 JSON 解码时守住
-// “一个已成功的销毁申请编号只能对应一份已关闭清册”的要求。
-//
-// 直接把对象解码进普通 map 时，encoding/json 对同名键只会保留最后一个
-// 值：保存内容中若写了两份同申请编号的清册，前一份会被静默覆盖。由于两份
-// 清册可能各自都符合档案归属、条目快照、期限与处理日期规则，仅留下后一份
-// 时保管库仍能打开，取回的清册随保存顺序改变——已成功的销毁申请只能对应
-// 一份已关闭清册，这种重复保存不是正常的申请重试（幂等重放应取回唯一的原
-// 清册，绝不应在保存层产生两份记录）。UnmarshalJSON 逐键解码并按解码后的
-// 实际文本核对申请编号，出现重复时返回 duplicateApplicationIDError，由
-// load 统一包装成 ErrCorruptState。
-type manifestMap map[string]*manifestRecord
-
-// UnmarshalJSON 逐键解码清册集合，发现同一申请编号对应两份清册即报错。
-//
-// 编号按 JSON 字符串解码后的实际文本识别：直接写出的 "APP-1" 与通过
-// Unicode 转义写出的同一编号仍算重复；不同清册记录内部都带有处理日期、
-// 条目、档案编号等同名字段（如各自的 "application_id"、"entries"）属于
-// 正常保存格式，与此无关——那些是清册记录内部的字段，不是清册集合对象的
-// 键。键的解码经过与值内文本一致的 JSON 转义处理，因此不会因保存文字
-// 看起来不同而放行重复编号。
-func (m *manifestMap) UnmarshalJSON(raw []byte) error {
-	// manifests 保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		*m = manifestMap{}
-		return nil
+func (e *uniqueKeyError) Error() string {
+	switch e.Collection {
+	case archiveCollection:
+		return "retention: 档案编号 " + e.ID + " 在保存的档案集合中登记了多次"
+	case manifestCollection:
+		return "retention: 申请编号 " + e.ID + " 在保存的清册集合中对应了多份清册"
 	}
-	// 先用只保留键文本的解码拿到稳定的键序，再逐键把原始片段解码成清册，
-	// 保证同编号键出现两次时不是“后者覆盖前者”，而是明确报错。
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	startTok, err := dec.Token()
+	return "retention: 编号 " + e.ID + " 在保存的记录集合中出现了多次"
+}
+
+// archiveMap 以档案编号为键保存登记记录。
+//
+// 集合格式、编号解码与“一个档案编号只能登记一次”的唯一性规则与清册集合
+// 完全相同，统一由 decodeUniqueKeyedObject 守住，这里只提供档案集合自己的
+// 记录类型与字段名。普通解码会让同编号键的后一份登记静默覆盖前一份（例如
+// 前一份带着未解除的诉讼冻结、后一份冻结列表为空，读取后只剩后一份，销毁
+// 资格会被误判）。除键不重复外，每条记录的身份还必须自洽：用于找到该记录
+// 的键与记录内容里的 id 必须同为非空白文本且逐字相同。键与 id 是两处独立
+// 保存的文本，普通解码不会核对它们，可能出现挂在 A-1 名下、id 却写成 A-2，
+// 或 id 缺失、为 null、空串、只有空白的记录——按 A-1 查到的历史会标着 A-2，
+// 销毁还可能把 A-2 写进清册。这层检查不在解码中完成（解码只负责拒绝重复
+// 键），而由 load 的 validateArchiveIdentity 在进入任何业务操作前统一核对，
+// 命中即包装成 ErrCorruptState：绝不做去空白、大小写归一化、改号或补写缺失
+// 编号。
+type archiveMap map[string]*archiveRecord
+
+// UnmarshalJSON 逐键解码档案集合；集合格式、编号解码与重复编号检测共用
+// decodeUniqueKeyedObject，命中的重复编号错误在 load 中按档案集合的说明
+// （重复登记）包装成 ErrCorruptState。
+func (m *archiveMap) UnmarshalJSON(raw []byte) error {
+	out, err := decodeUniqueKeyedObject[archiveRecord](raw, archiveCollection)
 	if err != nil {
 		return err
 	}
-	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: manifests 字段不是 JSON 对象")
-	}
-
-	out := manifestMap{}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		id, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("retention: manifests 字段的申请编号不是 JSON 字符串")
-		}
-		var rec manifestRecord
-		if err := dec.Decode(&rec); err != nil {
-			return err
-		}
-		if _, dup := out[id]; dup {
-			return &duplicateApplicationIDError{ID: id}
-		}
-		out[id] = &rec
-	}
-	// 消费对象结束括号，确保整个值恰好是一个对象。
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	*m = out
+	*m = archiveMap(out)
 	return nil
 }
 
-// duplicateApplicationIDError 表示保存的清册集合中同一申请编号对应了多份
-// 清册。它在包内由 load 统一包装成可由 ErrCorruptState 识别的错误。
-type duplicateApplicationIDError struct {
-	ID string
-}
+// manifestMap 以申请编号为键保存已关闭清册。
+//
+// 集合格式、编号解码与“一个已成功的销毁申请编号只能对应一份已关闭清册”
+// 的唯一性规则与档案集合完全相同，统一由 decodeUniqueKeyedObject 守住，这里
+// 只提供清册集合自己的记录类型与字段名。普通解码会让同编号键的后一份清册
+// 静默覆盖前一份：两份清册可能各自都符合档案归属、条目快照、期限与处理日期
+// 规则，仅留下后一份时保管库仍能打开，取回的清册却随保存顺序改变——已成功
+// 的销毁申请只能对应一份已关闭清册，这种重复保存不是正常的申请重试（幂等
+// 重放应取回唯一的原清册，绝不应在保存层产生两份记录）。
+type manifestMap map[string]*manifestRecord
 
-func (e *duplicateApplicationIDError) Error() string {
-	return "retention: 申请编号 " + e.ID + " 在保存的清册集合中对应了多份清册"
+// UnmarshalJSON 逐键解码清册集合；集合格式、编号解码与重复编号检测共用
+// decodeUniqueKeyedObject，命中的重复编号错误在 load 中按清册集合的说明
+// （该申请编号对应多份清册）包装成 ErrCorruptState。
+func (m *manifestMap) UnmarshalJSON(raw []byte) error {
+	out, err := decodeUniqueKeyedObject[manifestRecord](raw, manifestCollection)
+	if err != nil {
+		return err
+	}
+	*m = manifestMap(out)
+	return nil
 }
 
 type storeData struct {
