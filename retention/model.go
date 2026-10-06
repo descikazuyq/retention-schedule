@@ -3,6 +3,7 @@ package retention
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -165,6 +166,125 @@ type archiveRecord struct {
 	Revisions  []*revisionRecord `json:"revisions,omitempty"`
 }
 
+// UnmarshalJSON 逐字段解码一份档案的登记记录，守住“同一份档案的保存内容中
+// 冻结列表 freezes 最多只能出现一次”的要求。
+//
+// 直接把登记记录解码进结构体时，encoding/json 对同名字段只保留最后一个值：
+// 同一份档案的保存内容中若写了两次 freezes，先保存的冻结历史会被后一次静默
+// 替换（例如先保存包含未解除诉讼冻结的 freezes，后面又保存一个空的 freezes，
+// 读取后历史里原冻结消失，到期后的销毁前核对可能误报可以办理）。这样的记录
+// 不能被当成没有冻结的正常档案使用。
+//
+// 因此这里逐个读取登记记录的字段名：字段名按 JSON 字符串解码后的实际文本
+// 识别——直接写出的 "freezes" 与通过 Unicode 转义写出、解码后相同的写法是
+// 同一个字段；现有能识别为冻结列表的大小写写法（如 "Freezes"，沿用
+// encoding/json 的大小写不敏感匹配）单独出现时继续可读，与标准写法混用重复
+// 保存同样算重复。冻结列表第二次出现时立即返回 errDuplicateFreezesField：
+// 两处列表内容是否完全一致、是否分别保存不同冻结、其中一处是否为空列表或
+// null，都不影响拒绝——绝不合并两处列表、不挑选其中一份，拒绝结果与两处的
+// 保存顺序无关。
+//
+// 检查只针对这份档案自己的保存内容：不同档案各自的冻结列表互不影响，冻结
+// 记录内部的同名字段（id、原因、日期）也不是列表字段，不会被误判；其余字段
+// 保持既有读取行为（同名字段沿用 encoding/json 的后者覆盖前者，未知字段跳过）。
+func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
+	// 记录保存为 null 时保持零值（与 encoding/json 对 null 的既有行为一致），
+	// 缺少有效 id 等问题由 load 的语义校验按损坏报告。
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: 档案登记记录不是 JSON 对象")
+	}
+	freezesSeen := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: 档案登记记录的字段名不是 JSON 字符串")
+		}
+		switch {
+		case strings.EqualFold(key, "freezes"):
+			// 重复检查必须先于解码：即使第二处为空列表或 null，也不能让它
+			// 把先保存的冻结历史整批替换后继续使用。
+			if freezesSeen {
+				return errDuplicateFreezesField
+			}
+			freezesSeen = true
+			if err := dec.Decode(&r.Freezes); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "id"):
+			if err := dec.Decode(&r.ID); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "category"):
+			if err := dec.Decode(&r.Category); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "start"):
+			if err := dec.Decode(&r.Start); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "end"):
+			if err := dec.Decode(&r.End); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "initial_end"):
+			if err := dec.Decode(&r.InitialEnd); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "destroyed"):
+			if err := dec.Decode(&r.Destroyed); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "manifest_id"):
+			if err := dec.Decode(&r.ManifestID); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "revisions"):
+			if err := dec.Decode(&r.Revisions); err != nil {
+				return err
+			}
+		default:
+			// 未知字段与既有行为一致：跳过不校验。
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return err
+			}
+		}
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// errDuplicateFreezesField 表示同一份档案的保存内容中冻结列表 freezes 出现了
+// 两次或更多次。它在解码时尚不知道档案编号（编号是集合对象的键），由
+// archiveMap 在解码出错的键处包装成 duplicateFreezesFieldError 并附上编号，
+// 再由 load 统一包装成可由 ErrCorruptState 识别的错误。
+var errDuplicateFreezesField = errors.New("retention: 冻结列表 freezes 在单份档案的保存内容中出现了多次")
+
+// duplicateFreezesFieldError 表示档案 ID 的保存内容中冻结列表 freezes 出现了
+// 两次或更多次。错误说明重复的是冻结列表本身，而不是某个冻结编号重复。
+type duplicateFreezesFieldError struct {
+	ID string
+}
+
+func (e *duplicateFreezesFieldError) Error() string {
+	return "retention: 档案 " + e.ID + " 的保存内容中冻结列表 freezes 出现了多次"
+}
+
 // revisionRecord 是一条已保存的截止日修订；文本字段保存时均已去除首尾空白。
 type revisionRecord struct {
 	ID     string `json:"id"`
@@ -234,8 +354,10 @@ type manifestEntry struct {
 // 两类集合各自不同、不在这里合并的部分由参数传入：fieldName 与 idKind 只用于
 // 错误信息，T 决定每条记录的内容结构，duplicate 按解码出的重复编号构造该集合
 // 自己的重复错误（档案集合说明重复登记，清册集合说明同一申请对应多份清册），
-// 再由 load 统一包装成 ErrCorruptState。
-func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplicate func(id string) error) (map[string]*T, error) {
+// 再由 load 统一包装成 ErrCorruptState。recordErr 在逐键解码单条记录出错时
+// 用该记录的查找编号包装错误（档案集合用它给冻结列表重复错误附上档案编号），
+// 为 nil 时记录解码错误原样返回。
+func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplicate func(id string) error, recordErr func(id string, err error) error) (map[string]*T, error) {
 	// 集合保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return map[string]*T{}, nil
@@ -263,6 +385,9 @@ func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplic
 		}
 		var rec T
 		if err := dec.Decode(&rec); err != nil {
+			if recordErr != nil {
+				return nil, recordErr(id, err)
+			}
 			return nil, err
 		}
 		if _, dup := out[id]; dup {
@@ -296,10 +421,20 @@ type archiveMap map[string]*archiveRecord
 // UnmarshalJSON 逐键解码档案集合，发现重复编号即报 duplicateArchiveIDError。
 // 集合格式、编号按 JSON 解码实际文本识别、记录内部同名字段不算集合键等
 // 共同读取规则统一由 unmarshalKeyedRecordMap 维护，这里只传入档案集合自己的
-// 字段名、编号称谓与重复错误。
+// 字段名、编号称谓与重复错误。逐键解码单份登记记录时，若记录自己的保存内容
+// 中冻结列表 freezes 出现了两次或更多次（archiveRecord.UnmarshalJSON 返回
+// errDuplicateFreezesField），在这里用该记录的查找编号包装成
+// duplicateFreezesFieldError——重复检查只针对这份档案自己的保存内容，不同
+// 档案各自的冻结列表不会合在一起计数。
 func (m *archiveMap) UnmarshalJSON(raw []byte) error {
 	out, err := unmarshalKeyedRecordMap[archiveRecord](raw, "archives", "档案编号",
-		func(id string) error { return &duplicateArchiveIDError{ID: id} })
+		func(id string) error { return &duplicateArchiveIDError{ID: id} },
+		func(id string, err error) error {
+			if errors.Is(err, errDuplicateFreezesField) {
+				return &duplicateFreezesFieldError{ID: id}
+			}
+			return err
+		})
 	if err != nil {
 		return err
 	}
@@ -344,7 +479,7 @@ type manifestMap map[string]*manifestRecord
 // 维护，这里只传入清册集合自己的字段名、编号称谓与重复错误。
 func (m *manifestMap) UnmarshalJSON(raw []byte) error {
 	out, err := unmarshalKeyedRecordMap[manifestRecord](raw, "manifests", "申请编号",
-		func(id string) error { return &duplicateApplicationIDError{ID: id} })
+		func(id string) error { return &duplicateApplicationIDError{ID: id} }, nil)
 	if err != nil {
 		return err
 	}
