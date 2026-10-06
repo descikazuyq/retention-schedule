@@ -318,9 +318,17 @@ func (e *duplicateArchiveIDError) Error() string {
 // 清册可能各自都符合档案归属、条目快照、期限与处理日期规则，仅留下后一份
 // 时保管库仍能打开，取回的清册随保存顺序改变——已成功的销毁申请只能对应
 // 一份已关闭清册，这种重复保存不是正常的申请重试（幂等重放应取回唯一的原
-// 清册，绝不应在保存层产生两份记录）。UnmarshalJSON 逐键解码并按解码后的
-// 实际文本核对申请编号，出现重复时返回 duplicateApplicationIDError，由
-// load 统一包装成 ErrCorruptState。
+// 清册，绝不应在保存层产生两份记录）。除键不重复外，每份清册的身份还必须
+// 自洽：用于找到该清册的键与清册内容里的 application_id 必须同为非空白
+// 文本且逐字相同。键与 application_id 是两处独立保存的文本，普通解码不会
+// 核对它们，可能出现挂在 APP-1 名下、application_id 却写成 APP-2，或该
+// 字段缺失、为 null、空串、只有空白的清册——按 APP-1 取回的清册会标着
+// APP-2，档案归属却仍指向 APP-1。这层检查不在 UnmarshalJSON 中完成（解码
+// 只负责拒绝重复键），而由 load 的 validateManifestIdentity 在进入任何
+// 业务操作前统一核对，命中即包装成 ErrCorruptState：绝不做去空白、大小写
+// 归一化、用查找编号补写清册、以清册内容改号或删除冲突记录。
+// UnmarshalJSON 只负责逐键解码并按解码后的实际文本核对申请编号，出现重复时
+// 返回 duplicateApplicationIDError，由 load 统一包装成 ErrCorruptState。
 type manifestMap map[string]*manifestRecord
 
 // UnmarshalJSON 逐键解码清册集合，发现同一申请编号对应两份清册即报
