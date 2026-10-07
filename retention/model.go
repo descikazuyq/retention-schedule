@@ -191,7 +191,7 @@ type archiveRecord struct {
 // 检查只针对这份档案自己的保存内容：不同档案各自的冻结列表、修订列表互不
 // 影响，冻结与修订记录内部的同名字段（id、原因、日期）也不是列表字段，不会
 // 被误判；其余字段保持既有读取行为（同名字段沿用 encoding/json 的后者覆盖
-// 前者，未知字段跳过）。三层对象共同的字段读取、字段名识别与重复字段拒绝
+// 前者，未知字段跳过）。各层对象共同的字段读取、字段名识别与重复字段拒绝
 // 统一由 unmarshalJSONObject 维护，这里只声明这份登记记录自己的字段与两个
 // 受唯一性限制的列表。
 func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
@@ -308,7 +308,7 @@ type freezeRecord struct {
 //
 // 检查只针对这条冻结自己的保存内容：同一档案不同冻结、不同档案各自的解除
 // 标记不合在一起计数；其余字段保持既有读取行为（同名字段沿用 encoding/json
-// 的后者覆盖前者，未知字段跳过）。三层对象共同的字段读取、字段名识别与重复
+// 的后者覆盖前者，未知字段跳过）。各层对象共同的字段读取、字段名识别与重复
 // 字段拒绝统一由 unmarshalJSONObject 维护，这里只声明这条冻结记录自己的
 // 字段与唯一受限制的解除标记。
 func (r *freezeRecord) UnmarshalJSON(raw []byte) error {
@@ -362,6 +362,69 @@ type manifestRecord struct {
 	Entries     []manifestEntry `json:"entries"`
 }
 
+// UnmarshalJSON 逐字段解码一份已关闭清册记录，守住“同一份清册的保存内容中
+// 处理日期 processed_on 最多只能出现一次”的要求。
+//
+// 直接把清册记录解码进结构体时，encoding/json 对同名字段只保留最后一个值：
+// 同一份清册的保存内容中若写了两次 processed_on，先写的处理日期会被后一次
+// 静默替换（例如档案截止日为 2025-01-10，清册先写处理日期 2025-01-10、后写
+// 2025-01-11，其他内容均合法时保管库仍能打开，取回的销毁日期却取决于两处的
+// 保存顺序）。已关闭清册应当明确记录唯一的处理日期，这样的记录不能被当成
+// 正常历史继续使用。
+//
+// 因此这里逐个读取清册记录的字段名：字段名按 JSON 字符串解码后的实际文本
+// 识别——直接写出的 "processed_on" 与通过 Unicode 转义写出、解码后相同的
+// 写法是同一个字段；现有能识别为处理日期的大小写写法（如 "Processed_On"，
+// 沿用 encoding/json 的大小写不敏感匹配）单独出现时继续可读，与标准写法混用
+// 重复保存同样算重复。处理日期第二次出现时立即返回
+// duplicateProcessedOnFieldError：两处日期不同、完全相同，或其中一处为
+// null，都不影响拒绝——绝不挑选其中一个日期继续使用，拒绝结果与两处的保存
+// 顺序无关；即使条目快照、档案归属与处理日期都合法，也不能掩盖重复字段。
+//
+// 检查只针对这份清册自己的保存内容：多份清册各自保存一个处理日期是正常
+// 记录，不合在一起计数；清册条目内部的同名字段也不是清册记录的处理日期，
+// 不会被误判；其余字段保持既有读取行为（同名字段沿用 encoding/json 的后者
+// 覆盖前者，未知字段跳过）。各层对象共同的字段读取、字段名识别与重复字段
+// 拒绝统一由 unmarshalJSONObject 维护，这里只声明这份清册自己的字段与唯一
+// 受限制的处理日期。
+func (r *manifestRecord) UnmarshalJSON(raw []byte) error {
+	// 记录保存为 null 时保持零值（与 encoding/json 对 null 的既有行为一致），
+	// 缺少处理日期等问题由 load 的语义校验按损坏报告。
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	// 申请编号可能写在重复的处理日期之后，先单独取出用于错误信息；
+	// 编号缺失、为空白等问题由 load 的语义校验按损坏报告。
+	var probe struct {
+		ApplicationID string `json:"application_id"`
+	}
+	_ = json.Unmarshal(raw, &probe)
+	return unmarshalJSONObject(raw, "清册记录", "清册记录", []jsonObjectField{
+		{name: "application_id", decode: func(dec *json.Decoder) error { return dec.Decode(&r.ApplicationID) }},
+		{
+			name:   "processed_on",
+			decode: func(dec *json.Decoder) error { return dec.Decode(&r.ProcessedOn) },
+			// 重复检查必须先于解码：即使两处日期完全相同或其中一处为 null，
+			// 也不能让后一个处理日期顶替先保存的处理日期后继续使用。
+			duplicate: func() error { return &duplicateProcessedOnFieldError{ApplicationID: probe.ApplicationID} },
+		},
+		{name: "entries", decode: func(dec *json.Decoder) error { return dec.Decode(&r.Entries) }},
+	})
+}
+
+// duplicateProcessedOnFieldError 表示申请编号 ApplicationID 的清册保存内容中
+// 处理日期 processed_on 出现了两次或更多次。错误说明重复的是处理日期
+// processed_on 本身，而不是该申请编号对应了多份清册。解码时先填入从清册
+// 内容里预解码出的 application_id，再由 manifestMap 在解码出错的键处补上
+// 集合查找编号，最后由 load 统一包装成可由 ErrCorruptState 识别的错误。
+type duplicateProcessedOnFieldError struct {
+	ApplicationID string
+}
+
+func (e *duplicateProcessedOnFieldError) Error() string {
+	return "retention: 清册 " + e.ApplicationID + " 的保存内容中处理日期 processed_on 出现了多次"
+}
+
 type manifestEntry struct {
 	ID       string `json:"id"`
 	Category string `json:"category"`
@@ -370,8 +433,9 @@ type manifestEntry struct {
 }
 
 // jsonObjectField 描述一个 JSON 对象中参与逐字段读取的字段。保存记录最外层、
-// 单份档案登记内容与单条冻结记录三层对象按同一套规则读取字段，各层只声明自己
-// 有哪些字段、字段值解码到哪里，以及哪些字段受“只能出现一次”限制。
+// 单份档案登记内容、单条冻结记录与单份清册记录四层对象按同一套规则读取字段，
+// 各层只声明自己有哪些字段、字段值解码到哪里，以及哪些字段受“只能出现一次”
+// 限制。
 type jsonObjectField struct {
 	// name 是该字段的规范字段名。字段名按 JSON 字符串解码后的实际文本做
 	// 大小写不敏感匹配（沿用 encoding/json 的匹配规则）：直接写出的字段名、
@@ -384,9 +448,9 @@ type jsonObjectField struct {
 	duplicate func() error
 }
 
-// unmarshalJSONObject 按保存记录最外层、单份档案登记内容与单条冻结记录三层
-// 共同的读取规则解码一个 JSON 对象：三层各自重复维护的字段读取、字段名识别与
-// 重复字段拒绝只在这里维护一份。
+// unmarshalJSONObject 按保存记录最外层、单份档案登记内容、单条冻结记录与单份
+// 清册记录四层共同的读取规则解码一个 JSON 对象：各层重复维护的字段读取、
+// 字段名识别与重复字段拒绝只在这里维护一份。
 //
 // 共同读取规则：
 //   - 原始文本的第一个 token 必须是对象左括号，否则以 objectKind 报“不是 JSON
@@ -410,8 +474,8 @@ type jsonObjectField struct {
 //
 // 各层不同、不在这里合并的部分由 fields 传入：规范字段名、值的解码目标，以及
 // 每个受限制字段第二次出现时返回的错误（最外层是档案集合/清册集合重复，单份
-// 档案是冻结列表/修订列表重复，单条冻结是解除标记重复），再由 load 统一包装
-// 成可由 ErrCorruptState 识别的错误。
+// 档案是冻结列表/修订列表重复，单条冻结是解除标记重复，单份清册是处理日期
+// 重复），再由 load 统一包装成可由 ErrCorruptState 识别的错误。
 func unmarshalJSONObject(raw []byte, objectKind, keyScope string, fields []jsonObjectField) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	startTok, err := dec.Token()
@@ -486,8 +550,9 @@ func unmarshalJSONObject(raw []byte, objectKind, keyScope string, fields []jsonO
 // 错误信息，T 决定每条记录的内容结构，duplicate 按解码出的重复编号构造该集合
 // 自己的重复错误（档案集合说明重复登记，清册集合说明同一申请对应多份清册），
 // 再由 load 统一包装成 ErrCorruptState。recordErr 在逐键解码单条记录出错时
-// 用该记录的查找编号包装错误（档案集合用它给冻结列表、修订列表重复错误附上
-// 档案编号），为 nil 时记录解码错误原样返回。
+// 用该记录的查找编号包装错误（档案集合用它给冻结列表、修订列表与解除标记
+// 重复错误附上档案编号；清册集合用它给处理日期重复错误附上申请编号），为 nil
+// 时记录解码错误原样返回。
 func unmarshalKeyedRecordMap[T any](raw []byte, fieldName, idKind string, duplicate func(id string) error, recordErr func(id string, err error) error) (map[string]*T, error) {
 	// 集合保存为 null 与字段缺失等价，按空集合处理（与既有兼容行为一致）。
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -624,10 +689,28 @@ type manifestMap map[string]*manifestRecord
 // UnmarshalJSON 逐键解码清册集合，发现同一申请编号对应两份清册即报
 // duplicateApplicationIDError。集合格式、编号按 JSON 解码实际文本识别、
 // 记录内部同名字段不算集合键等共同读取规则统一由 unmarshalKeyedRecordMap
-// 维护，这里只传入清册集合自己的字段名、编号称谓与重复错误。
+// 维护，这里只传入清册集合自己的字段名、编号称谓与重复错误。逐键解码单份
+// 清册记录时，若该清册自己的保存内容中处理日期 processed_on 出现了两次或
+// 更多次（manifestRecord.UnmarshalJSON 返回 duplicateProcessedOnFieldError），
+// 在这里用该记录的查找编号补上申请编号——重复检查只针对这份清册自己的保存
+// 内容，多份清册各自保存一个处理日期是正常记录，不合在一起计数。
 func (m *manifestMap) UnmarshalJSON(raw []byte) error {
 	out, err := unmarshalKeyedRecordMap[manifestRecord](raw, "manifests", "申请编号",
-		func(id string) error { return &duplicateApplicationIDError{ID: id} }, nil)
+		func(id string) error { return &duplicateApplicationIDError{ID: id} },
+		func(id string, err error) error {
+			// 单份清册自己的保存内容中处理日期 processed_on 出现了两次或更多次
+			// 时，优先用清册集合的查找编号（非空白、稳定）指出是哪份清册；查找
+			// 编号理论上不会为空白（正常保存时键即申请编号），空白时退回清册
+			// 内容里预解码出的申请编号。
+			var dupProcessedOn *duplicateProcessedOnFieldError
+			if errors.As(err, &dupProcessedOn) {
+				if strings.TrimSpace(id) != "" {
+					dupProcessedOn.ApplicationID = id
+				}
+				return dupProcessedOn
+			}
+			return err
+		})
 	if err != nil {
 		return err
 	}
@@ -677,7 +760,7 @@ type storeData struct {
 // 同名字段是正常保存格式，多份清册内部各自带有的申请编号、处理日期和条目字段
 // 也是正常保存格式，不会被误判为最外层集合重复；集合内部同一编号出现两次仍
 // 分别由 archiveMap.UnmarshalJSON 与 manifestMap.UnmarshalJSON 按既有规则拒绝。
-// 三层对象共同的字段读取、字段名识别与重复字段拒绝统一由
+// 各层对象共同的字段读取、字段名识别与重复字段拒绝统一由
 // unmarshalJSONObject 维护，这里只声明最外层自己的字段与两个受唯一性限制的
 // 集合。
 func (d *storeData) UnmarshalJSON(raw []byte) error {
