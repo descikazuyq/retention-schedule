@@ -505,17 +505,12 @@ func (s *Store) load() (*storeData, error) {
 	if err := validateFreezeIDs(data); err != nil {
 		return nil, err
 	}
-	// 每条冻结保留的原始信息必须与办理冻结时的要求一致：非空白的冻结原因
-	// 与有效的冻结日期齐备。缺少任一项的冻结（无论是否已解除、所属档案
-	// 是否已销毁）都不能当作正常历史使用，必须先按整库损坏拒绝。
-	if err := validateFreezeOriginRecords(data); err != nil {
-		return nil, err
-	}
-	// 语义校验先于任何兼容处理：已解除冻结必须与既有解除功能遵守同一要求——
-	// 解除原因与解除日期齐备，且解除日期不早于冻结日期。
-	// 只有“已解除”标记而缺少任一信息，或解除日期早于冻结日期的记录
-	// 一律判为损坏（即使所属档案已销毁）；绝不据此继续办理或修补记录。
-	if err := validateFreezeReleaseRecords(data); err != nil {
+	// 每条冻结记录自身的完整性——原始信息与解除信息——必须与办理冻结、解除时的
+	// 要求一致：每条冻结保留非空白的冻结原因与有效的冻结日期；已解除冻结还须
+	// 带有非空白的解除原因与有效的解除日期，且解除日期不早于冻结日期。
+	// 缺少任一项或日期倒置的记录（无论是否已解除、所属档案是否已销毁）都不能
+	// 当作正常历史使用，必须先按整库损坏拒绝；绝不据此继续办理或修补记录。
+	if err := validateFreezeRecords(data); err != nil {
 		return nil, err
 	}
 	// 每份档案的起算日与当前生效的截止日都必须存在且顺序合法，
@@ -763,24 +758,35 @@ func validateFreezeIDs(data *storeData) error {
 	return nil
 }
 
-// validateFreezeOriginRecords 检查库内每条冻结保留的原始信息是否完整：
-// 非空白的冻结原因与有效的冻结日期必须齐备。
+// validateFreezeRecords 检查库内每条冻结记录自身的完整性：原始信息（非空白的
+// 冻结原因与有效的冻结日期）必须齐备；已解除冻结的解除信息（非空白的解除原因、
+// 有效的解除日期，且解除日期不早于冻结日期）也必须完整合法。
 //
 // 办理新增冻结时，冻结原因（去除首尾空白后不得为空白）与冻结日期（真实的
 // YYYY-MM-DD 日期）都是必填项，保存下来的每条冻结也必须满足同一要求。
 // 保存记录中的冻结原因缺失、为 null、为空串或仅含空白，都算缺少冻结原因；
 // 冻结日期字段缺失或为 null，都算缺少冻结日期（已填写的日期仍由 Date 的
 // 解析校验守住真实日期要求）。缺少任一项的冻结已无法说明自己因何、自何时
-// 冻结，不能当作正常记录交给历史查询与销毁前核对：返回可由 ErrCorruptState
-// 识别的错误，错误信息给出档案编号、冻结编号，并说明缺少的是冻结原因还是
-// 冻结日期；两项同时缺少时两项都说明。
+// 冻结，不能当作正常记录交给历史查询与销毁前核对。
+//
+// 正常解除保存的记录必然同时带有非空白的解除原因和有效的解除日期，且解除
+// 日期不早于冻结日期——与解除功能办理时的要求一致。缺少解除原因、解除日期
+// 缺失或为 null、解除日期早于冻结日期，都说明保存内容已损坏。未解除冻结
+// 没有解除日期和原因是合法状态，不在此报错；解除日期等于冻结日期合法。
+//
+// 命中任一问题时返回可由 ErrCorruptState 识别的错误，错误信息给出档案编号、
+// 冻结编号与具体问题：原始信息缺项说明缺少的是冻结原因还是冻结日期（两项
+// 同时缺少时两项都说明）；解除信息缺项说明缺少的是解除原因还是解除日期
+// （同时缺少时先说明解除原因）；日期倒置时同时给出解除日期与冻结日期两项
+// 日期。多条记录存在问题时，原始信息缺项优先于解除信息的问题报告；同类
+// 问题按档案编号次序和冻结登记次序报告首个错误。
 //
 // 校验覆盖整个保管库全部档案的全部冻结历史——未解除与已解除的冻结都检查，
 // 已销毁档案的冻结同样检查：已解除冻结保存的解除日期与解除原因再完整，也
 // 不能拿解除日期代替冻结日期、拿解除原因补齐冻结原因；清册归属、条目与
-// 处理日期都正确也不能掩盖这条缺项。绝不自动补写日期或原因、删除冻结或
-// 更改解除状态，原保存内容保持原样。没有冻结的档案是合法记录，不在此报错。
-func validateFreezeOriginRecords(data *storeData) error {
+// 处理日期都正确也不能掩盖缺项。绝不自动补写日期或原因、删除冻结或更改
+// 解除状态，原保存内容保持原样。没有冻结的档案是合法记录，不在此报错。
+func validateFreezeRecords(data *storeData) error {
 	// map 遍历顺序不稳定，按档案编号排序、冻结按登记顺序检查，
 	// 保证错误信息稳定。
 	archiveIDs := make([]string, 0, len(data.Archives))
@@ -788,6 +794,9 @@ func validateFreezeOriginRecords(data *storeData) error {
 		archiveIDs = append(archiveIDs, id)
 	}
 	sort.Strings(archiveIDs)
+	// 原始信息缺项优先于解除信息的问题：解除信息的首个错误先记下并继续
+	// 扫描，确认全部冻结历史都没有原始信息缺项后再报告它。
+	var releaseErr error
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil {
@@ -815,65 +824,32 @@ func validateFreezeOriginRecords(data *storeData) error {
 					"retention: 档案 %s 的冻结 %s 缺少冻结日期，记录已损坏: %w",
 					id, fr.ID, ErrCorruptState)
 			}
-		}
-	}
-	return nil
-}
-
-// validateFreezeReleaseRecords 检查库内全部已解除冻结记录是否完整合法。
-//
-// 正常解除保存的记录必然同时带有非空白的解除原因和有效的解除日期，
-// 且解除日期不早于冻结日期。缺少解除原因、解除日期缺失或为 null、
-// 解除日期早于冻结日期，都说明保存内容已损坏，返回可由 ErrCorruptState
-// 识别的错误，并在信息中给出涉及的档案编号与冻结编号，便于定位记录。
-// 校验覆盖整个保管库的全部已解除冻结，与本次办理名单无关：
-// 即使异常记录所属档案已经销毁，也不能把不完整的解除信息当作正常历史。
-// 未解除冻结没有解除日期和原因是合法状态，不在此报错。
-// 调用前 validateFreezeOriginRecords 已确认每条冻结的冻结原因与冻结日期
-// 齐备，这里的日期比较必然有有效的冻结日期可依。
-func validateFreezeReleaseRecords(data *storeData) error {
-	// map 遍历顺序不稳定，按档案编号排序后再检查，保证错误信息稳定。
-	archiveIDs := make([]string, 0, len(data.Archives))
-	for id := range data.Archives {
-		archiveIDs = append(archiveIDs, id)
-	}
-	sort.Strings(archiveIDs)
-	for _, id := range archiveIDs {
-		ar := data.Archives[id]
-		if ar == nil {
-			return fmt.Errorf("retention: 档案 %s 的登记记录缺失，状态文件已损坏: %w",
-				id, ErrCorruptState)
-		}
-		for _, fr := range ar.Freezes {
-			if fr == nil {
-				return fmt.Errorf("retention: 档案 %s 下存在缺失的冻结记录，状态文件已损坏: %w",
-					id, ErrCorruptState)
-			}
-			if !fr.Released {
-				// 未解除冻结没有解除日期与原因是合法状态。
+			// 未解除冻结没有解除日期与原因是合法状态；解除信息只保留首个
+			// 错误，其余记录仍须继续检查原始信息缺项。
+			if !fr.Released || releaseErr != nil {
 				continue
 			}
 			switch {
 			case strings.TrimSpace(fr.ReleaseReason) == "":
-				return fmt.Errorf(
+				releaseErr = fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 标记为已解除但缺少解除原因，记录已损坏: %w",
 					id, fr.ID, ErrCorruptState)
 			case fr.ReleasedOn == nil:
-				return fmt.Errorf(
+				releaseErr = fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 标记为已解除但缺少解除日期，记录已损坏: %w",
 					id, fr.ID, ErrCorruptState)
 			case fr.ReleasedOn.IsZero():
-				return fmt.Errorf(
+				releaseErr = fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 的解除日期无效，记录已损坏: %w",
 					id, fr.ID, ErrCorruptState)
 			case fr.ReleasedOn.Before(*fr.FrozenOn):
-				return fmt.Errorf(
+				releaseErr = fmt.Errorf(
 					"retention: 档案 %s 的冻结 %s 的解除日期 %s 早于冻结日期 %s，记录已损坏: %w",
 					id, fr.ID, fr.ReleasedOn, *fr.FrozenOn, ErrCorruptState)
 			}
 		}
 	}
-	return nil
+	return releaseErr
 }
 
 // validateArchiveRetentionDates 检查库内每份档案的起算日与当前生效的保管截止日
@@ -906,7 +882,7 @@ func validateArchiveRetentionDates(data *storeData) error {
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil {
-			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			// 缺失的登记记录已由 validateFreezeIDs 报告。
 			continue
 		}
 		switch {
@@ -952,7 +928,7 @@ func validateManifestConsistency(data *storeData) error {
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil {
-			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			// 缺失的登记记录已由 validateFreezeIDs 报告。
 			continue
 		}
 		if !ar.Destroyed {
@@ -1050,7 +1026,7 @@ func validateManifestConsistency(data *storeData) error {
 // 同一档案有多条冻结时，其他冻结已经解除不能抵消这一条阻碍，逐份档案只要
 // 命中第一条未解除冻结即报错；即使这条记录里残留了解除日期或解除原因，只要
 // 仍标记为未解除，就不能据此当作已解除——是否解除只沿用保存的解除标记判断，
-// 解除日期与原因的合法性仍由 validateFreezeReleaseRecords 单独核对。
+// 解除日期与原因的合法性仍由 validateFreezeRecords 核对。
 // 校验覆盖整个保管库的全部已销毁档案，与本次办理名单或查询目标无关：
 // 一份清册收录多份档案，只有其中一份矛盾，或调用者只操作另一份正常档案时，
 // 整份保管库同样判为损坏，绝不返回其余档案的正常结果。绝不通过自动解除冻结、
@@ -1067,13 +1043,13 @@ func validateDestroyedArchiveFreezes(data *storeData) error {
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil || !ar.Destroyed {
-			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告；
+			// 缺失的登记记录已由 validateFreezeIDs 报告；
 			// 尚未销毁的档案保留未解除冻结是合法状态。
 			continue
 		}
 		for _, fr := range ar.Freezes {
 			if fr == nil {
-				// 空冻结记录已由 validateFreezeReleaseRecords 报告。
+				// 空冻结记录已由 validateFreezeIDs 报告。
 				continue
 			}
 			if !fr.Released {
@@ -1226,7 +1202,7 @@ func validateRevisionContinuity(data *storeData) error {
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil {
-			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			// 缺失的登记记录已由 validateFreezeIDs 报告。
 			continue
 		}
 		if len(ar.Revisions) == 0 {
@@ -1306,7 +1282,7 @@ func validateRetentionHistoryDates(data *storeData) error {
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil {
-			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			// 缺失的登记记录已由 validateFreezeIDs 报告。
 			continue
 		}
 		if ar.InitialEnd.Before(ar.Start) {
@@ -1355,7 +1331,7 @@ func validateRevisionIDs(data *storeData) error {
 	for _, id := range archiveIDs {
 		ar := data.Archives[id]
 		if ar == nil {
-			// 缺失的登记记录已由 validateFreezeReleaseRecords 报告。
+			// 缺失的登记记录已由 validateFreezeIDs 报告。
 			continue
 		}
 		for _, rec := range ar.Revisions {
