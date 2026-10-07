@@ -345,6 +345,125 @@ type freezeRecord struct {
 	ReleasedOn *Date `json:"released_on,omitempty"`
 }
 
+// UnmarshalJSON 逐字段解码一条冻结记录，守住“同一条冻结记录的保存内容中
+// 解除标记 released 最多只能出现一次”的要求。
+//
+// 直接把冻结记录解码进结构体时，encoding/json 对同名字段只保留最后一个值：
+// 同一条冻结若先写 released:false、后写 released:true 并带有合法的解除原因
+// 和日期，读取会采用后一个标记——档案到期后，销毁前核对可能据此显示可以办理，
+// 正式销毁也会忽略这条冻结。这样的记录不能被当成已解除（或未解除）的正常冻结
+// 使用：出现两次或更多次 released 时，无论两处值相反、完全相同，还是其中一处
+// 为 null，都按保存记录损坏处理，绝不选取其中一个值继续使用；即使解除原因、
+// 日期、档案期限和清册归属均合法，也不能掩盖重复标记。
+//
+// 因此这里逐个读取冻结记录的字段名：字段名按 JSON 字符串解码后的实际文本
+// 识别——直接写出的 "released" 与通过 Unicode 转义写出、解码后相同的写法是
+// 同一个标记；现有能识别为解除标记的大小写写法（如 "Released"，沿用
+//
+//	encoding/json 的大小写不敏感匹配）单独出现时继续可读，与标准写法混用重复
+//
+// 保存同样算重复。第二次出现时先记下重复、继续读完整条记录（字段顺序任意，
+// 冻结编号可能写在后面），解码结束后统一返回 duplicateReleasedFieldError，
+// 因此交换字段顺序不改变拒绝结果，错误也始终能带上冻结编号。
+//
+// 检查只针对这一条冻结自己的保存内容：同一档案的其他冻结、其他档案各自的
+// 解除标记互不合在一起计数；其余字段保持既有读取行为（同名字段沿用
+// encoding/json 的后者覆盖前者，未知字段跳过）。
+func (r *freezeRecord) UnmarshalJSON(raw []byte) error {
+	// 记录保存为 null 时保持零值（与 encoding/json 对 null 的既有行为一致），
+	// 缺少有效 id 等问题由 load 的语义校验按损坏报告。
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: 冻结记录不是 JSON 对象")
+	}
+	releasedSeen := false
+	releasedDup := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: 冻结记录的字段名不是 JSON 字符串")
+		}
+		switch {
+		case strings.EqualFold(key, "released"):
+			if releasedSeen {
+				// 重复与第二处的值无关：值相反、完全相同或为 null 都一样
+				// 拒绝。仍把值消费掉，以便读完整条记录、拿到冻结编号后
+				// 再统一报错。
+				releasedDup = true
+				var skip json.RawMessage
+				if err := dec.Decode(&skip); err != nil {
+					return err
+				}
+				continue
+			}
+			releasedSeen = true
+			if err := dec.Decode(&r.Released); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "id"):
+			if err := dec.Decode(&r.ID); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "reason"):
+			if err := dec.Decode(&r.Reason); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "frozen_on"):
+			if err := dec.Decode(&r.FrozenOn); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "release_reason"):
+			if err := dec.Decode(&r.ReleaseReason); err != nil {
+				return err
+			}
+		case strings.EqualFold(key, "released_on"):
+			if err := dec.Decode(&r.ReleasedOn); err != nil {
+				return err
+			}
+		default:
+			// 未知字段与既有行为一致：跳过不校验。
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return err
+			}
+		}
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	if releasedDup {
+		// 冻结编号可能写在重复的 released 之后，此时已经读到。
+		return &duplicateReleasedFieldError{FreezeID: r.ID}
+	}
+	return nil
+}
+
+// duplicateReleasedFieldError 表示同一条冻结记录的保存内容中解除标记 released
+// 出现了两次或更多次。冻结记录解码时只知道冻结编号，档案编号（档案集合对象的
+// 键）由 archiveMap 在解码出错的键处补入，再由 load 统一包装成可由
+// ErrCorruptState 识别的错误。错误说明重复的是解除标记 released 本身，而不是
+// 冻结编号重复或冻结列表重复。
+type duplicateReleasedFieldError struct {
+	ArchiveID string
+	FreezeID  string
+}
+
+func (e *duplicateReleasedFieldError) Error() string {
+	return "retention: 档案 " + e.ArchiveID + " 的冻结 " + e.FreezeID + " 的保存内容中解除标记 released 出现了多次"
+}
+
 type manifestRecord struct {
 	ApplicationID string `json:"application_id"`
 	// ProcessedOn 用指针保存：清册缺少处理日期或保存为 null 时保持 nil，
@@ -453,9 +572,11 @@ type archiveMap map[string]*archiveRecord
 // 字段名、编号称谓与重复错误。逐键解码单份登记记录时，若记录自己的保存内容
 // 中冻结列表 freezes 或修订列表 revisions 出现了两次或更多次
 // （archiveRecord.UnmarshalJSON 返回 errDuplicateFreezesField /
-// errDuplicateRevisionsField），在这里用该记录的查找编号包装成
-// duplicateFreezesFieldError / duplicateRevisionsFieldError——重复检查只针对
-// 这份档案自己的保存内容，不同档案各自的列表不会合在一起计数。
+// errDuplicateRevisionsField），或某条冻结记录自己的保存内容中解除标记
+// released 出现了两次或更多次（freezeRecord.UnmarshalJSON 返回
+// duplicateReleasedFieldError），在这里用该记录的查找编号包装——重复检查只
+// 针对这份档案（这条冻结）自己的保存内容，不同档案、不同冻结各自的字段不会
+// 合在一起计数。
 func (m *archiveMap) UnmarshalJSON(raw []byte) error {
 	out, err := unmarshalKeyedRecordMap[archiveRecord](raw, "archives", "档案编号",
 		func(id string) error { return &duplicateArchiveIDError{ID: id} },
@@ -465,6 +586,10 @@ func (m *archiveMap) UnmarshalJSON(raw []byte) error {
 			}
 			if errors.Is(err, errDuplicateRevisionsField) {
 				return &duplicateRevisionsFieldError{ID: id}
+			}
+			var dupReleased *duplicateReleasedFieldError
+			if errors.As(err, &dupReleased) {
+				return &duplicateReleasedFieldError{ArchiveID: id, FreezeID: dupReleased.FreezeID}
 			}
 			return err
 		})
