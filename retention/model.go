@@ -191,95 +191,39 @@ type archiveRecord struct {
 // 检查只针对这份档案自己的保存内容：不同档案各自的冻结列表、修订列表互不
 // 影响，冻结与修订记录内部的同名字段（id、原因、日期）也不是列表字段，不会
 // 被误判；其余字段保持既有读取行为（同名字段沿用 encoding/json 的后者覆盖
-// 前者，未知字段跳过）。
+// 前者，未知字段跳过）。三层对象共同的字段读取、字段名识别与重复字段拒绝
+// 统一由 unmarshalJSONObject 维护，这里只声明这份登记记录自己的字段与两个
+// 受唯一性限制的列表。
 func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
 	// 记录保存为 null 时保持零值（与 encoding/json 对 null 的既有行为一致），
 	// 缺少有效 id 等问题由 load 的语义校验按损坏报告。
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	startTok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: 档案登记记录不是 JSON 对象")
-	}
-	freezesSeen := false
-	revisionsSeen := false
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("retention: 档案登记记录的字段名不是 JSON 字符串")
-		}
-		switch {
-		case strings.EqualFold(key, "freezes"):
+	return unmarshalJSONObject(raw, "档案登记记录", "档案登记记录", []jsonObjectField{
+		{
+			name:   "freezes",
+			decode: func(dec *json.Decoder) error { return dec.Decode(&r.Freezes) },
 			// 重复检查必须先于解码：即使第二处为空列表或 null，也不能让它
 			// 把先保存的冻结历史整批替换后继续使用。
-			if freezesSeen {
-				return errDuplicateFreezesField
-			}
-			freezesSeen = true
-			if err := dec.Decode(&r.Freezes); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "id"):
-			if err := dec.Decode(&r.ID); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "category"):
-			if err := dec.Decode(&r.Category); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "start"):
-			if err := dec.Decode(&r.Start); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "end"):
-			if err := dec.Decode(&r.End); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "initial_end"):
-			if err := dec.Decode(&r.InitialEnd); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "destroyed"):
-			if err := dec.Decode(&r.Destroyed); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "manifest_id"):
-			if err := dec.Decode(&r.ManifestID); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "revisions"):
+			duplicate: func() error { return errDuplicateFreezesField },
+		},
+		{name: "id", decode: func(dec *json.Decoder) error { return dec.Decode(&r.ID) }},
+		{name: "category", decode: func(dec *json.Decoder) error { return dec.Decode(&r.Category) }},
+		{name: "start", decode: func(dec *json.Decoder) error { return dec.Decode(&r.Start) }},
+		{name: "end", decode: func(dec *json.Decoder) error { return dec.Decode(&r.End) }},
+		{name: "initial_end", decode: func(dec *json.Decoder) error { return dec.Decode(&r.InitialEnd) }},
+		{name: "destroyed", decode: func(dec *json.Decoder) error { return dec.Decode(&r.Destroyed) }},
+		{name: "manifest_id", decode: func(dec *json.Decoder) error { return dec.Decode(&r.ManifestID) }},
+		{
+			name:   "revisions",
+			decode: func(dec *json.Decoder) error { return dec.Decode(&r.Revisions) },
 			// 重复检查必须先于解码：即使第二处为空列表或 null，也不能让它
 			// 把先保存的修订历史整批替换后继续使用（当前截止日仍与最初期限
 			// 一致时保管库看似正常，但修订记录与已占用的修订编号已经消失）。
-			if revisionsSeen {
-				return errDuplicateRevisionsField
-			}
-			revisionsSeen = true
-			if err := dec.Decode(&r.Revisions); err != nil {
-				return err
-			}
-		default:
-			// 未知字段与既有行为一致：跳过不校验。
-			var skip json.RawMessage
-			if err := dec.Decode(&skip); err != nil {
-				return err
-			}
-		}
-	}
-	// 消费对象结束括号，确保整个值恰好是一个对象。
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	return nil
+			duplicate: func() error { return errDuplicateRevisionsField },
+		},
+	})
 }
 
 // errDuplicateFreezesField 表示同一份档案的保存内容中冻结列表 freezes 出现了
@@ -364,7 +308,9 @@ type freezeRecord struct {
 //
 // 检查只针对这条冻结自己的保存内容：同一档案不同冻结、不同档案各自的解除
 // 标记不合在一起计数；其余字段保持既有读取行为（同名字段沿用 encoding/json
-// 的后者覆盖前者，未知字段跳过）。
+// 的后者覆盖前者，未知字段跳过）。三层对象共同的字段读取、字段名识别与重复
+// 字段拒绝统一由 unmarshalJSONObject 维护，这里只声明这条冻结记录自己的
+// 字段与唯一受限制的解除标记。
 func (r *freezeRecord) UnmarshalJSON(raw []byte) error {
 	// 记录保存为 null 时保持零值（与 encoding/json 对 null 的既有行为一致），
 	// 空冻结记录由 load 的语义校验按损坏报告。
@@ -377,68 +323,20 @@ func (r *freezeRecord) UnmarshalJSON(raw []byte) error {
 		ID string `json:"id"`
 	}
 	_ = json.Unmarshal(raw, &probe)
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	startTok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: 冻结记录不是 JSON 对象")
-	}
-	releasedSeen := false
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("retention: 冻结记录的字段名不是 JSON 字符串")
-		}
-		switch {
-		case strings.EqualFold(key, "released"):
+	return unmarshalJSONObject(raw, "冻结记录", "冻结记录", []jsonObjectField{
+		{
+			name:   "released",
+			decode: func(dec *json.Decoder) error { return dec.Decode(&r.Released) },
 			// 重复检查必须先于解码：即使第二处取相反的值、完全相同的值或为
 			// null，也不能让后一个标记顶替先保存的解除状态后继续使用。
-			if releasedSeen {
-				return &duplicateReleasedFieldError{FreezeID: probe.ID}
-			}
-			releasedSeen = true
-			if err := dec.Decode(&r.Released); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "id"):
-			if err := dec.Decode(&r.ID); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "reason"):
-			if err := dec.Decode(&r.Reason); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "frozen_on"):
-			if err := dec.Decode(&r.FrozenOn); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "release_reason"):
-			if err := dec.Decode(&r.ReleaseReason); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "released_on"):
-			if err := dec.Decode(&r.ReleasedOn); err != nil {
-				return err
-			}
-		default:
-			// 未知字段与既有行为一致：跳过不校验。
-			var skip json.RawMessage
-			if err := dec.Decode(&skip); err != nil {
-				return err
-			}
-		}
-	}
-	// 消费对象结束括号，确保整个值恰好是一个对象。
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	return nil
+			duplicate: func() error { return &duplicateReleasedFieldError{FreezeID: probe.ID} },
+		},
+		{name: "id", decode: func(dec *json.Decoder) error { return dec.Decode(&r.ID) }},
+		{name: "reason", decode: func(dec *json.Decoder) error { return dec.Decode(&r.Reason) }},
+		{name: "frozen_on", decode: func(dec *json.Decoder) error { return dec.Decode(&r.FrozenOn) }},
+		{name: "release_reason", decode: func(dec *json.Decoder) error { return dec.Decode(&r.ReleaseReason) }},
+		{name: "released_on", decode: func(dec *json.Decoder) error { return dec.Decode(&r.ReleasedOn) }},
+	})
 }
 
 // duplicateReleasedFieldError 表示同一条冻结记录的保存内容中解除标记 released
@@ -469,6 +367,100 @@ type manifestEntry struct {
 	Category string `json:"category"`
 	Start    Date   `json:"start"`
 	End      Date   `json:"end"`
+}
+
+// jsonObjectField 描述一个 JSON 对象中参与逐字段读取的字段。保存记录最外层、
+// 单份档案登记内容与单条冻结记录三层对象按同一套规则读取字段，各层只声明自己
+// 有哪些字段、字段值解码到哪里，以及哪些字段受“只能出现一次”限制。
+type jsonObjectField struct {
+	// name 是该字段的规范字段名。字段名按 JSON 字符串解码后的实际文本做
+	// 大小写不敏感匹配（沿用 encoding/json 的匹配规则）：直接写出的字段名、
+	// 现有大小写写法与 Unicode 转义写法，解码后文本相等即为同一个字段。
+	name string
+	// decode 读取字段对应的 JSON 值并写入本层的解码目标。
+	decode func(dec *json.Decoder) error
+	// duplicate 在该字段第二次出现时构造本层自己的重复字段错误；为 nil 时
+	// 该字段不受唯一性限制，重复出现沿用 encoding/json 后者覆盖前者的行为。
+	duplicate func() error
+}
+
+// unmarshalJSONObject 按保存记录最外层、单份档案登记内容与单条冻结记录三层
+// 共同的读取规则解码一个 JSON 对象：三层各自重复维护的字段读取、字段名识别与
+// 重复字段拒绝只在这里维护一份。
+//
+// 共同读取规则：
+//   - 原始文本的第一个 token 必须是对象左括号，否则以 objectKind 报“不是 JSON
+//     对象”；对象保存为 null 的兼容处理由需要它的调用方在进入本函数前完成
+//     （整个文件为 null 由 load 在解码前单独拒绝）；
+//   - 逐个读取对象字段：字段名必须是 JSON 字符串，否则以 keyScope 报“字段名
+//     不是 JSON 字符串”。字段名按 JSON 字符串解码后的实际文本识别——直接写出
+//     的字段名与通过 Unicode 转义写出、解码后相同的写法是同一个字段；现有大小
+//     写写法（沿用 encoding/json 的大小写不敏感匹配）单独出现时继续可读，与标准
+//     写法混用、或与转义写法混用重复出现，同样算同一字段；
+//   - 对受唯一性限制的字段（duplicate 非 nil），重复检查先于解码：字段第二次
+//     出现时立即返回 duplicate()，两处取值完全相同、相反、其中一处为空集合、
+//     空列表或 null 都不影响拒绝，绝不合并、不挑选后一份，拒绝结果与两处的保存
+//     顺序无关。检查只针对字段所在对象自身：外层集合、同层各条记录内部的同名字段
+//     各自独立计数，未知对象里的同名字段不会被算到受限制的外层字段；
+//   - 不受唯一性限制的字段与未知字段保持既有读取行为：已知字段重复出现时沿用
+//     encoding/json 的后者覆盖前者，未知字段跳过不校验，原本允许缺省或单次为
+//     null 的集合、列表和标记继续沿用各自含义；
+//   - 最后消费对象结束括号，保证整个值恰好是一个对象；对象之后再拼接任何内容
+//     由外层 json.Unmarshal 的“整值恰好一个 JSON 值”校验拒绝。
+//
+// 各层不同、不在这里合并的部分由 fields 传入：规范字段名、值的解码目标，以及
+// 每个受限制字段第二次出现时返回的错误（最外层是档案集合/清册集合重复，单份
+// 档案是冻结列表/修订列表重复，单条冻结是解除标记重复），再由 load 统一包装
+// 成可由 ErrCorruptState 识别的错误。
+func unmarshalJSONObject(raw []byte, objectKind, keyScope string, fields []jsonObjectField) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	startTok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("retention: %s不是 JSON 对象", objectKind)
+	}
+	seen := make([]bool, len(fields))
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("retention: %s的字段名不是 JSON 字符串", keyScope)
+		}
+		idx := -1
+		for i := range fields {
+			if strings.EqualFold(key, fields[i].name) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			// 未知字段与既有行为一致：跳过不校验。
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return err
+			}
+			continue
+		}
+		// 重复检查必须先于解码：即使第二处为空集合、空列表、null，或与第一处
+		// 取值完全相同、相反，也不能让后一个值顶替先保存的值后继续使用。
+		if fields[idx].duplicate != nil && seen[idx] {
+			return fields[idx].duplicate()
+		}
+		seen[idx] = true
+		if err := fields[idx].decode(dec); err != nil {
+			return err
+		}
+	}
+	// 消费对象结束括号，确保整个值恰好是一个对象。
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // unmarshalKeyedRecordMap 按档案集合与清册集合共同的读取规则解码一个以编号
@@ -685,62 +677,25 @@ type storeData struct {
 // 同名字段是正常保存格式，多份清册内部各自带有的申请编号、处理日期和条目字段
 // 也是正常保存格式，不会被误判为最外层集合重复；集合内部同一编号出现两次仍
 // 分别由 archiveMap.UnmarshalJSON 与 manifestMap.UnmarshalJSON 按既有规则拒绝。
+// 三层对象共同的字段读取、字段名识别与重复字段拒绝统一由
+// unmarshalJSONObject 维护，这里只声明最外层自己的字段与两个受唯一性限制的
+// 集合。
 func (d *storeData) UnmarshalJSON(raw []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	startTok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	if delim, ok := startTok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("retention: 保存记录不是 JSON 对象")
-	}
-	archivesSeen := false
-	manifestsSeen := false
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("retention: 保存记录最外层的字段名不是 JSON 字符串")
-		}
-		switch {
-		case strings.EqualFold(key, "archives"):
-			if archivesSeen {
-				return &duplicateArchivesFieldError{}
-			}
-			archivesSeen = true
-			if err := dec.Decode(&d.Archives); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "manifests"):
+	return unmarshalJSONObject(raw, "保存记录", "保存记录最外层", []jsonObjectField{
+		{
+			name:      "archives",
+			decode:    func(dec *json.Decoder) error { return dec.Decode(&d.Archives) },
+			duplicate: func() error { return &duplicateArchivesFieldError{} },
+		},
+		{
+			name:   "manifests",
+			decode: func(dec *json.Decoder) error { return dec.Decode(&d.Manifests) },
 			// 重复检查必须先于解码：即使第二处为空对象或 null，也不能让它
 			// 把第一处清册集合整批替换成空集合后继续使用。
-			if manifestsSeen {
-				return &duplicateManifestsFieldError{}
-			}
-			manifestsSeen = true
-			if err := dec.Decode(&d.Manifests); err != nil {
-				return err
-			}
-		case strings.EqualFold(key, "version"):
-			if err := dec.Decode(&d.Version); err != nil {
-				return err
-			}
-		default:
-			// 未知字段与既有行为一致：跳过不校验。
-			var skip json.RawMessage
-			if err := dec.Decode(&skip); err != nil {
-				return err
-			}
-		}
-	}
-	// 消费对象结束括号，确保整个值恰好是一个对象。
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	return nil
+			duplicate: func() error { return &duplicateManifestsFieldError{} },
+		},
+		{name: "version", decode: func(dec *json.Decoder) error { return dec.Decode(&d.Version) }},
+	})
 }
 
 // duplicateArchivesFieldError 表示保存记录的最外层出现了两次或更多次档案
