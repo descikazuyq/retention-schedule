@@ -167,26 +167,29 @@ type archiveRecord struct {
 }
 
 // UnmarshalJSON 逐字段解码一份档案的登记记录，守住“同一份档案的保存内容中
-// 冻结列表 freezes 最多只能出现一次”的要求。
+// 冻结列表 freezes 与修订列表 revisions 各自最多只能出现一次”的要求。
 //
 // 直接把登记记录解码进结构体时，encoding/json 对同名字段只保留最后一个值：
 // 同一份档案的保存内容中若写了两次 freezes，先保存的冻结历史会被后一次静默
 // 替换（例如先保存包含未解除诉讼冻结的 freezes，后面又保存一个空的 freezes，
-// 读取后历史里原冻结消失，到期后的销毁前核对可能误报可以办理）。这样的记录
-// 不能被当成没有冻结的正常档案使用。
+// 读取后历史里原冻结消失，到期后的销毁前核对可能误报可以办理）；写了两次
+// revisions 时先保存的修订列表会被后一次整批替换——第一处保存着两条期限修订，
+// 第二处是空列表时，读取后两次修订消失、当前期限仍与最初期限一致，已占用的
+// 修订编号还可能重新用于业务。这样的记录不能被当成只有该列表内容的正常档案使用。
 //
 // 因此这里逐个读取登记记录的字段名：字段名按 JSON 字符串解码后的实际文本
-// 识别——直接写出的 "freezes" 与通过 Unicode 转义写出、解码后相同的写法是
-// 同一个字段；现有能识别为冻结列表的大小写写法（如 "Freezes"，沿用
-// encoding/json 的大小写不敏感匹配）单独出现时继续可读，与标准写法混用重复
-// 保存同样算重复。冻结列表第二次出现时立即返回 errDuplicateFreezesField：
-// 两处列表内容是否完全一致、是否分别保存不同冻结、其中一处是否为空列表或
-// null，都不影响拒绝——绝不合并两处列表、不挑选其中一份，拒绝结果与两处的
-// 保存顺序无关。
+// 识别——直接写出的 "freezes"/"revisions" 与通过 Unicode 转义写出、解码后
+// 相同的写法是同一个字段；现有能识别为对应列表的大小写写法（如 "Freezes"/
+// "Revisions"，沿用 encoding/json 的大小写不敏感匹配）单独出现时继续可读，
+// 与标准写法混用重复保存同样算重复。任一字段第二次出现时立即返回对应的
+// errDuplicate…Field 哨兵错误：两处列表内容是否完全一致、是否分别保存不同
+// 条目、其中一处是否为空列表或 null，都不影响拒绝——绝不合并两处列表、不
+// 挑选其中一份，拒绝结果与两处的保存顺序无关。
 //
-// 检查只针对这份档案自己的保存内容：不同档案各自的冻结列表互不影响，冻结
-// 记录内部的同名字段（id、原因、日期）也不是列表字段，不会被误判；其余字段
-// 保持既有读取行为（同名字段沿用 encoding/json 的后者覆盖前者，未知字段跳过）。
+// 检查只针对这份档案自己的保存内容：不同档案各自的冻结、修订列表互不影响，
+// 列表记录内部的同名字段（id、原因、日期）也不是列表字段，不会被误判；其余
+// 字段保持既有读取行为（同名字段沿用 encoding/json 的后者覆盖前者，未知字段
+// 跳过）。
 func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
 	// 记录保存为 null 时保持零值（与 encoding/json 对 null 的既有行为一致），
 	// 缺少有效 id 等问题由 load 的语义校验按损坏报告。
@@ -202,6 +205,7 @@ func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
 		return fmt.Errorf("retention: 档案登记记录不是 JSON 对象")
 	}
 	freezesSeen := false
+	revisionsSeen := false
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -251,6 +255,13 @@ func (r *archiveRecord) UnmarshalJSON(raw []byte) error {
 				return err
 			}
 		case strings.EqualFold(key, "revisions"):
+			// 重复检查必须先于解码：即使第二处为空列表或 null，也不能让它
+			// 把先保存的修订历史整批替换（修订消失、占用的编号可能被重新
+			// 用于业务）后继续使用。
+			if revisionsSeen {
+				return errDuplicateRevisionsField
+			}
+			revisionsSeen = true
 			if err := dec.Decode(&r.Revisions); err != nil {
 				return err
 			}
@@ -283,6 +294,22 @@ type duplicateFreezesFieldError struct {
 
 func (e *duplicateFreezesFieldError) Error() string {
 	return "retention: 档案 " + e.ID + " 的保存内容中冻结列表 freezes 出现了多次"
+}
+
+// errDuplicateRevisionsField 表示同一份档案的保存内容中修订列表 revisions
+// 出现了两次或更多次。它在解码时尚不知道档案编号（编号是集合对象的键），由
+// archiveMap 在解码出错的键处包装成 duplicateRevisionsFieldError 并附上编号，
+// 再由 load 统一包装成可由 ErrCorruptState 识别的错误。
+var errDuplicateRevisionsField = errors.New("retention: 修订列表 revisions 在单份档案的保存内容中出现了多次")
+
+// duplicateRevisionsFieldError 表示档案 ID 的保存内容中修订列表 revisions 出现
+// 了两次或更多次。错误说明重复的是修订列表本身，而不是某个修订编号重复。
+type duplicateRevisionsFieldError struct {
+	ID string
+}
+
+func (e *duplicateRevisionsFieldError) Error() string {
+	return "retention: 档案 " + e.ID + " 的保存内容中修订列表 revisions 出现了多次"
 }
 
 // revisionRecord 是一条已保存的截止日修订；文本字段保存时均已去除首尾空白。
@@ -422,16 +449,20 @@ type archiveMap map[string]*archiveRecord
 // 集合格式、编号按 JSON 解码实际文本识别、记录内部同名字段不算集合键等
 // 共同读取规则统一由 unmarshalKeyedRecordMap 维护，这里只传入档案集合自己的
 // 字段名、编号称谓与重复错误。逐键解码单份登记记录时，若记录自己的保存内容
-// 中冻结列表 freezes 出现了两次或更多次（archiveRecord.UnmarshalJSON 返回
-// errDuplicateFreezesField），在这里用该记录的查找编号包装成
-// duplicateFreezesFieldError——重复检查只针对这份档案自己的保存内容，不同
-// 档案各自的冻结列表不会合在一起计数。
+// 中冻结列表 freezes 或修订列表 revisions 出现了两次或更多次
+// （archiveRecord.UnmarshalJSON 返回对应的 errDuplicate…Field 哨兵错误），在
+// 这里用该记录的查找编号包装成 duplicateFreezesFieldError /
+// duplicateRevisionsFieldError——重复检查只针对这份档案自己的保存内容，不同
+// 档案各自的冻结、修订列表不会合在一起计数。
 func (m *archiveMap) UnmarshalJSON(raw []byte) error {
 	out, err := unmarshalKeyedRecordMap[archiveRecord](raw, "archives", "档案编号",
 		func(id string) error { return &duplicateArchiveIDError{ID: id} },
 		func(id string, err error) error {
 			if errors.Is(err, errDuplicateFreezesField) {
 				return &duplicateFreezesFieldError{ID: id}
+			}
+			if errors.Is(err, errDuplicateRevisionsField) {
+				return &duplicateRevisionsFieldError{ID: id}
 			}
 			return err
 		})
